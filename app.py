@@ -3,8 +3,10 @@
 import base64
 import hashlib
 import hmac
+import html as htmllib
 import json
 import os
+import re
 import secrets
 import shutil
 from datetime import datetime
@@ -15,6 +17,7 @@ import pandas as pd
 import streamlit as st
 import streamlit.components.v1 as components
 from openpyxl.utils import get_column_letter
+from PIL import Image, ImageOps
 
 # =========================
 # إعدادات الصفحة
@@ -27,6 +30,7 @@ ORDERS_FILE = os.path.join(BASE_DIR, "OVVO_orders.xlsx")
 BANNER_PATH = os.path.join(BASE_DIR, "assets", "ovvo_inventory_banner.png")
 USERS_FILE = os.path.join(BASE_DIR, "ovvo_users.json")
 BACKUP_DIR = os.path.join(BASE_DIR, "backups")
+IMAGES_DIR = os.path.join(BASE_DIR, "assets", "products")
 MAX_BACKUPS = 30
 SHEET_NAME = "المخزون"
 
@@ -406,6 +410,223 @@ def qty(data):
     return pd.to_numeric(data["الكمية"], errors="coerce").fillna(0)
 
 
+# ---- صور المنتجات (لكل رقم موديل) ----
+SIZE_ORDER = ["XXS", "XS", "S", "M", "L", "XL", "XXL", "XXXL", "3XL", "4XL",
+              "FREE", "FREE SIZE"]
+
+
+def size_key(s):
+    u = str(s).strip().upper()
+    if u in SIZE_ORDER:
+        return (0, SIZE_ORDER.index(u), "")
+    try:
+        return (1, float(u), "")
+    except ValueError:
+        return (2, 0, u)
+
+
+def model_image_path(model):
+    model = str(model).strip()
+    if not model:
+        return None
+    safe = re.sub(r"[^\w\-]", "_", model)
+    return os.path.join(IMAGES_DIR, f"{safe}.jpg")
+
+
+def get_model_image(model):
+    p = model_image_path(model)
+    return p if p and os.path.isfile(p) else None
+
+
+def save_model_image(model, uploaded):
+    p = model_image_path(model)
+    if not p or uploaded is None:
+        return False
+    try:
+        os.makedirs(IMAGES_DIR, exist_ok=True)
+        img = ImageOps.exif_transpose(Image.open(uploaded))
+        if img.mode in ("RGBA", "LA", "P"):
+            img = img.convert("RGBA")
+            bg = Image.new("RGB", img.size, (255, 255, 255))
+            bg.paste(img, mask=img.split()[-1])
+            img = bg
+        else:
+            img = img.convert("RGB")
+        img.thumbnail((900, 900))
+        img.save(p, "JPEG", quality=88)
+        return True
+    except Exception as e:
+        st.error(f"تعذّر حفظ الصورة: {e}")
+        return False
+
+
+# ---- الباركود (Code 128 بدون أي مكتبات خارجية) ----
+CODE128_PATTERNS = [
+    "212222", "222122", "222221", "121223", "121322", "131222", "122213", "122312",
+    "132212", "221213", "221312", "231212", "112232", "122132", "122231", "113222",
+    "123122", "123221", "223211", "221132", "221231", "213212", "223112", "312131",
+    "311222", "321122", "321221", "312212", "322112", "322211", "212123", "212321",
+    "232121", "111323", "131123", "131321", "112313", "132113", "132311", "211313",
+    "231113", "231311", "112133", "112331", "132131", "113123", "113321", "133121",
+    "313121", "211331", "231131", "213113", "213311", "213131", "311123", "311321",
+    "331121", "312113", "312311", "332111", "314111", "221411", "431111", "111224",
+    "111422", "121124", "121421", "141122", "141221", "112214", "112412", "122114",
+    "122411", "142112", "142211", "241211", "221114", "413111", "241112", "134111",
+    "111242", "121142", "121241", "114212", "124112", "124211", "411212", "421112",
+    "421211", "212141", "214121", "412121", "111143", "111341", "131141", "114113",
+    "114311", "411113", "411311", "113141", "114131", "311141", "411131", "211412",
+    "211214", "211232", "2331112",
+]
+
+
+def code128_widths(text):
+    vals = [104]  # Start B
+    for ch in text:
+        o = ord(ch)
+        if not 32 <= o <= 126:
+            raise ValueError("unsupported character")
+        vals.append(o - 32)
+    chk = (104 + sum(v * i for i, v in enumerate(vals[1:], 1))) % 103
+    vals += [chk, 106]
+    return [int(c) for c in "".join(CODE128_PATTERNS[v] for v in vals)]
+
+
+def barcode_svg(text, vertical=False):
+    try:
+        widths = code128_widths(text)
+    except ValueError:
+        return ""
+    quiet, x, rects = 10, 10, []
+    for i, w in enumerate(widths):
+        if i % 2 == 0:
+            if vertical:
+                rects.append(f'<rect x="0" y="{x}" width="1" height="{w}"/>')
+            else:
+                rects.append(f'<rect x="{x}" y="0" width="{w}" height="1"/>')
+        x += w
+    total = x + quiet
+    box = f"0 0 1 {total}" if vertical else f"0 0 {total} 1"
+    return (f'<svg class="bars" viewBox="{box}" preserveAspectRatio="none" '
+            f'shape-rendering="crispEdges" xmlns="http://www.w3.org/2000/svg">'
+            f'{"".join(rects)}</svg>')
+
+
+LABEL_CSS = """
+*{box-sizing:border-box}
+body{margin:0;padding:8px;font-family:Arial,'Cairo',sans-serif;background:#fff;color:#000}
+.noprint{margin-bottom:10px;font-family:Cairo,Arial,sans-serif}
+.noprint button{font-weight:700;padding:8px 18px;border-radius:10px;border:1px solid #242421;
+  background:#fff;cursor:pointer;font-family:inherit}
+.sheet{display:flex;flex-wrap:wrap;gap:8px}
+.label{width:__W__mm;height:__H__mm;position:relative;overflow:hidden;background:#fff;
+  outline:1px solid #ccc}
+.lin{position:absolute;top:0;left:0;width:__DW__mm;height:__DH__mm;padding:1.2mm 1.5mm;
+  overflow:hidden;text-align:center;line-height:1.15;
+  -webkit-transform-origin:0 0;transform-origin:0 0}
+.lin.r90{left:__W__mm;-webkit-transform:rotate(90deg);transform:rotate(90deg)}
+.lin.r270{top:__H__mm;-webkit-transform:rotate(-90deg);transform:rotate(-90deg)}
+.hd{font-size:__F1__mm;font-weight:800;white-space:nowrap;overflow:hidden}
+.hd2{font-size:__F2__mm;font-weight:700;white-space:nowrap;overflow:hidden}
+.desc{font-size:__F1__mm;font-weight:700;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.meta{font-size:__F2__mm}
+.bars{display:block;width:100%;margin:.5mm 0}
+.code{font-size:__F2__mm;letter-spacing:.3mm;font-family:'Courier New',monospace}
+.price{font-size:__F3__mm;font-weight:800}
+.lin.vert{padding:0}
+.vbar{position:absolute;top:1.5mm;bottom:1.5mm;left:1.5mm;width:40%}
+.vbar .bars{position:absolute;left:0;top:0;width:72%;height:100%;margin:0}
+.vcode{position:absolute;left:76%;top:0;height:100%;width:24%;
+  -webkit-writing-mode:vertical-rl;writing-mode:vertical-rl;
+  -webkit-transform:rotate(180deg);transform:rotate(180deg);
+  font-size:__F2__mm;letter-spacing:.3mm;font-family:'Courier New',monospace;
+  white-space:nowrap;text-align:center}
+.vtext{position:absolute;top:1.5mm;bottom:1.5mm;left:44%;right:1.5mm;overflow:hidden}
+.vin{position:absolute;left:0;right:0;top:50%;
+  -webkit-transform:translateY(-50%);transform:translateY(-50%);text-align:center}
+.vin .desc{white-space:normal;overflow:visible;text-overflow:clip;margin-bottom:1.2mm}
+.vin .hd,.vin .hd2,.vin .meta{margin-bottom:1mm}
+@media print{
+  .noprint{display:none!important}
+  body{padding:0}
+  .sheet{display:block}
+  .label{outline:none;page-break-after:always;break-after:page}
+  .label:last-child{page-break-after:auto;break-after:auto}
+  __PRINT__
+}
+"""
+
+
+def labels_html(items, w=50, h=40, layout="label", show_price=True,
+                show_meta=True, autoprint=False, vertical=False,
+                header1="", header2="", rotate=0):
+    """items: قائمة من (dict، عدد النسخ). تُرجع صفحة HTML جاهزة للطباعة.
+    rotate: 0 أو 90 أو 270 (تدوير محتوى الملصق داخل الورقة)."""
+    esc = htmllib.escape
+    dw, dh = (h, w) if rotate in (90, 270) else (w, h)
+    k = max(0.5, min(dw / 50, dh / 30))
+    header1, header2 = str(header1).strip(), str(header2).strip()
+    rot_cls = {90: " r90", 270: " r270"}.get(rotate, "")
+    labels = []
+    for it, copies in items:
+        code = str(it.get("barcode", "")).strip()
+        if not code:
+            continue
+        meta = " / ".join(x for x in [str(it.get("color", "")).strip(),
+                                      str(it.get("size", "")).strip()] if x)
+        price_txt = ""
+        if show_price:
+            p = pd.to_numeric(it.get("price"), errors="coerce")
+            if not pd.isna(p) and float(p) > 0:
+                price_txt = f"{float(p):,.2f}"
+        svg = barcode_svg(code, vertical=vertical)
+        desc_txt = esc(str(it.get("desc", "")))
+        hd = ((f'<div class="hd">{esc(header1)}</div>' if header1 else "")
+              + (f'<div class="hd2">{esc(header2)}</div>' if header2 else ""))
+        meta_html = f'<div class="meta">{esc(meta)}</div>' if show_meta and meta else ""
+        price_html = f'<div class="price">{price_txt}</div>' if price_txt else ""
+        if vertical:
+            inner = (
+                f'<div class="lin vert{rot_cls}">'
+                '<div class="vbar">' + (svg or '<div class="bars"></div>')
+                + f'<div class="vcode">{esc(code)}</div></div>'
+                '<div class="vtext"><div class="vin">'
+                + hd + f'<div class="desc">{desc_txt}</div>' + meta_html + price_html
+                + "</div></div></div>"
+            )
+        else:
+            # ارتفاع الباركود = المتبقي بعد أسطر النص
+            lines = (3.0 * k * (1 if header1 else 0) + 2.6 * k * (1 if header2 else 0)
+                     + 3.0 * k + (2.6 * k if meta_html else 0) + 2.6 * k
+                     + (3.6 * k if price_html else 0))
+            bar_h = max(5.0, dh - 2.4 - lines * 1.22 - 1.5)
+            inner = (
+                f'<div class="lin{rot_cls}">' + hd
+                + f'<div class="desc">{desc_txt}</div>' + meta_html
+                + (svg.replace('class="bars"', f'class="bars" style="height:{bar_h:.1f}mm"')
+                   if svg else f'<div class="bars" style="height:{bar_h:.1f}mm"></div>')
+                + f'<div class="code">{esc(code)}</div>' + price_html + "</div>"
+            )
+        labels.extend([f'<div class="label">{inner}</div>'] * int(copies))
+
+    if layout == "a4":
+        print_rules = "@page{size:A4;margin:8mm} .sheet{display:flex!important;flex-wrap:wrap;gap:2mm} .label{outline:.2mm dashed #999!important;page-break-after:auto!important;break-after:auto!important;break-inside:avoid}"
+    else:
+        print_rules = f"@page{{size:{w}mm {h}mm;margin:0}}"
+
+    css = (LABEL_CSS.replace("__W__", str(w)).replace("__H__", str(h))
+           .replace("__DW__", str(dw)).replace("__DH__", str(dh))
+           .replace("__F1__", f"{3.0 * k:.2f}").replace("__F2__", f"{2.6 * k:.2f}")
+           .replace("__F3__", f"{3.6 * k:.2f}").replace("__PRINT__", print_rules))
+    script = ("<script>window.onload=function(){setTimeout(function(){window.print()},400)}</script>"
+              if autoprint else "")
+    return (
+        f'<!doctype html><html><head><meta charset="utf-8"><style>{css}</style></head><body>'
+        f'<div class="noprint"><button onclick="window.print()">🖨️ طباعة الملصقات</button> '
+        f'<span>{len(labels)} ملصق</span></div>'
+        f'<div class="sheet">{"".join(labels)}</div>{script}</body></html>'
+    )
+
+
 def stock_status(data, threshold):
     q = qty(data)
     return pd.Series(
@@ -474,10 +695,10 @@ with st.sidebar:
         f'<span style="color:#D6C1A3;font-size:13px;">{ROLE_LABELS.get(current_role, "")}</span></div>',
         unsafe_allow_html=True,
     )
-    pages = ["🏠 الرئيسية", "🔎 البحث", "📑 التقارير والطباعة"]
+    pages = ["🏠 الرئيسية", "📦 المخزون", "🔎 البحث", "📑 التقارير والطباعة"]
     if current_role == "admin":
-        pages = ["🏠 الرئيسية", "📦 المخزون", "➕ إضافة صنف", "🚚 التوصيل",
-                 "🔎 البحث", "📑 التقارير والطباعة", "👤 إدارة المستخدمين"]
+        pages = ["🏠 الرئيسية", "📦 المخزون", "➕ إضافة صنف", "🏷️ طباعة الباركود",
+                 "🚚 التوصيل", "🔎 البحث", "📑 التقارير والطباعة", "👤 إدارة المستخدمين"]
     page = st.radio("القائمة", pages, label_visibility="collapsed")
     st.markdown("<br>", unsafe_allow_html=True)
     if st.button("🚪 تسجيل الخروج", use_container_width=True):
@@ -506,7 +727,7 @@ def page_home():
         '</div>',
         unsafe_allow_html=True,
     )
-    
+
     c_img_col1, c_img_col2 = st.columns([1, 1])
     with c_img_col2:
         if image_base64:
@@ -559,15 +780,94 @@ def page_home():
 # =========================
 # المخزون
 # =========================
+def render_models_view(data, can_edit=True):
+    data = data.assign(_q=qty(data))
+    with_model = data[data["رقم الموديل"] != ""]
+    no_model = len(data) - len(with_model)
+
+    c1, c2 = st.columns([1, 1])
+    only_no_img = c1.checkbox("أظهر الموديلات بدون صورة فقط", key="mv_noimg")
+    per_page = c2.selectbox("عدد الموديلات بالصفحة", [9, 12, 24, 48], index=1, key="mv_pp")
+
+    models = sorted(with_model["رقم الموديل"].unique())
+    if only_no_img:
+        models = [m for m in models if not get_model_image(m)]
+    if not models:
+        st.info("لا توجد موديلات مطابقة.")
+        return
+
+    pages = max(1, -(-len(models) // per_page))
+    pg = st.number_input("الصفحة", min_value=1, max_value=pages, value=1, step=1,
+                         key="mv_page") if pages > 1 else 1
+    chunk = models[(pg - 1) * per_page: pg * per_page]
+    st.caption(f"{len(models):,} موديل"
+               + (f" — و{no_model} صنف بدون رقم موديل (تظهر في «جدول التعديل»)" if no_model else ""))
+
+    for row_start in range(0, len(chunk), 3):
+        cols = st.columns(3)
+        for col, model in zip(cols, chunk[row_start:row_start + 3]):
+            g = with_model[with_model["رقم الموديل"] == model]
+            colors = g["اللون"].replace("", "غير محدد")
+            sizes = g["المقاس"].replace("", "غير محدد")
+            with col, st.container(border=True):
+                img = get_model_image(model)
+                if img:
+                    st.image(img, use_container_width=True)
+                else:
+                    st.markdown(
+                        '<div style="height:180px;display:flex;align-items:center;'
+                        'justify-content:center;background:#EFE6D6;border-radius:10px;'
+                        'color:#8a7f6d;">لا توجد صورة</div>', unsafe_allow_html=True)
+                st.markdown(f"**{g['وصف'].iloc[0]}**  \nموديل: `{model}`")
+                m1, m2, m3 = st.columns(3)
+                m1.metric("القطع", f"{g['_q'].sum():,.0f}")
+                m2.metric("الألوان", colors.nunique())
+                m3.metric("المقاسات", sizes.nunique())
+
+                with st.expander("الألوان والمقاسات"):
+                    pv = pd.pivot_table(
+                        pd.DataFrame({"اللون": colors, "المقاس": sizes, "q": g["_q"]}),
+                        index="اللون", columns="المقاس", values="q",
+                        aggfunc="sum", fill_value=0,
+                    )
+                    pv = pv[sorted(pv.columns, key=size_key)]
+                    pv["المجموع"] = pv.sum(axis=1)
+                    pv.loc["المجموع"] = pv.sum()
+                    st.dataframe(pv.astype(int), use_container_width=True)
+
+                if can_edit:
+                    with st.expander("🖼️ تغيير الصورة"):
+                        up = st.file_uploader("اختر صورة", type=["png", "jpg", "jpeg", "webp"],
+                                              key=f"mv_up_{model}")
+                        if up and st.button("حفظ الصورة", key=f"mv_save_{model}"):
+                            if save_model_image(model, up):
+                                flash(f"تم حفظ صورة الموديل {model}.")
+                                st.rerun()
+
+
 def page_inventory():
-    require_admin()
-    page_header("إدارة المخزون", "عدّل الخلايا مباشرة ثم اضغط «حفظ التعديلات». تؤخذ نسخة احتياطية تلقائيًا قبل كل حفظ.")
+    can_edit = current_role == "admin"
+    if can_edit:
+        page_header("إدارة المخزون", "عدّل الخلايا مباشرة ثم اضغط «حفظ التعديلات». تؤخذ نسخة احتياطية تلقائيًا قبل كل حفظ.")
+    else:
+        page_header("المخزون", "عرض فقط — لا يمكن التعديل.")
     if df.empty:
-        st.info("لا توجد أصناف بعد. أضف أول صنف من صفحة «إضافة صنف».")
+        st.info("لا توجد أصناف بعد." + (" أضف أول صنف من صفحة «إضافة صنف»." if can_edit else ""))
         return
 
     filtered = filter_ui(df, "inv", threshold)
     st.caption(f"يعرض {len(filtered):,} من {len(df):,} صنف")
+
+    table_label = "✏️ جدول التعديل" if can_edit else "📋 الجدول"
+    mode = st.radio("طريقة العرض", ["🖼️ حسب الموديل", table_label],
+                    horizontal=True, label_visibility="collapsed")
+    if mode == "🖼️ حسب الموديل":
+        render_models_view(filtered, can_edit)
+        return
+
+    if not can_edit:
+        st.dataframe(filtered[VISIBLE_COLUMNS], use_container_width=True, hide_index=True)
+        return
 
     view = filtered[VISIBLE_COLUMNS].copy()
     view.insert(0, "حذف", False)
@@ -618,6 +918,7 @@ def page_inventory():
 def page_add_item():
     require_admin()
     page_header("إضافة صنف جديد", "الحقول المميّزة بـ * مطلوبة. الباقي اختياري.")
+    show_just_added()
     form_id = st.session_state.get("add_form_id", 0)
     types = sorted(t for t in df["نوع الصنف"].unique() if t)
     brands = sorted(b for b in df["الماركة"].unique() if b)
@@ -636,6 +937,18 @@ def page_add_item():
         brand_new = c2.text_input("أو اكتب ماركة جديدة")
         model = c3.text_input("رقم الموديل")
         barcode_in = c3.text_input("الباركود (اتركه فارغًا للتوليد التلقائي)")
+
+        st.markdown("#### ملصق الباركود")
+        p1, p2 = st.columns(2)
+        auto_print = p1.checkbox("اطبع ملصق الباركود مباشرة بعد الحفظ", value=True)
+        print_copies = p2.number_input("عدد الملصقات", min_value=1, max_value=500,
+                                       value=1, step=1)
+
+        st.markdown("#### صورة المنتج")
+        img_file = st.file_uploader(
+            "صورة الموديل (اختياري، وإذا الموديل إله صورة قبل رح تنستبدل)",
+            type=["png", "jpg", "jpeg", "webp"], key=f"img_{form_id}")
+        cam_file = st.camera_input("أو التقط صورة بالكاميرا", key=f"cam_{form_id}")
 
         c1, c2 = st.columns(2)
         color = c1.text_input("اللون")
@@ -671,11 +984,14 @@ def page_add_item():
     brand = brand_new.strip() or (brand_sel if brand_sel != none_opt else "")
     model, color, size = model.strip(), color.strip(), size.strip()
     barcode = barcode_in.strip() or next_barcode(df)
+    photo = img_file or cam_file
 
     if not desc.strip():
         st.error("اكتب وصف الصنف.")
     elif not item_type:
         st.error("اختر نوع الصنف أو اكتب نوعًا جديدًا.")
+    elif photo and not model:
+        st.error("لازم تكتب رقم الموديل عشان تنربط الصورة فيه.")
     elif (df["الباركود التلقائي"] == barcode).any():
         st.error(f"الباركود {barcode} مستخدم لصنف آخر.")
     elif model and ((df["رقم الموديل"] == model) & (df["اللون"] == color) & (df["المقاس"] == size)).any():
@@ -694,8 +1010,15 @@ def page_add_item():
         })
         updated = pd.concat([df, pd.DataFrame([row])], ignore_index=True)
         if save_data(updated):
+            if photo:
+                save_model_image(model, photo)
+            st.session_state["just_added"] = {
+                "item": {"barcode": barcode, "desc": desc.strip(), "color": color,
+                         "size": size, "price": price},
+                "copies": int(print_copies),
+                "auto": bool(auto_print),
+            }
             st.session_state["add_form_id"] = form_id + 1
-            flash(f"تمت إضافة «{desc.strip()}» برقم الباركود {barcode}.")
             st.rerun()
 
 
@@ -804,7 +1127,7 @@ def page_delivery():
                     f"({r['اللون']} / {r['المقاس']}) × الكمية الخارجة: **{int(r['الكمية'])}**  \n"
                     f"الباركود: {r['الباركود']} | المبلغ المطلوب الحالي: **{r['المبلغ المطلوب']:,.2f}** | الحالة: **{r['الحالة']}**"
                 )
-                
+
                 if r["الحالة"] == ST_OUT:
                     b1, b2, b3 = st.columns(3)
                     if b1.button("✅ تم التوصيل (كامل المبلغ)", key=f"d{i}", use_container_width=True):
@@ -820,19 +1143,19 @@ def page_delivery():
                         with st.form(f"form_edit_order_{i}"):
                             sold_qty = st.number_input("عدد القطع المباعة (التي تم الاحتفاظ بها)", min_value=0, max_value=int(r["الكمية"]), value=int(r["الكمية"]))
                             submit_edit = st.form_submit_button("تحديث الحساب والمبلغ وطلب المرتجع", type="primary")
-                        
+
                         if submit_edit:
                             return_qty = int(r["الكمية"]) - sold_qty
                             new_amount = sold_qty * float(r["سعر البيع"])
-                            
+
                             orders.loc[i, "الكمية"] = sold_qty
                             orders.loc[i, "المبلغ المطلوب"] = new_amount
                             orders.loc[i, "الحالة"] = ST_RET_WAIT
-                            
+
                             if return_qty > 0:
                                 adjust_stock(r["الباركود"], return_qty)
                                 orders.loc[i, "أُعيد للمخزون"] = True
-                            
+
                             if save_orders(orders):
                                 st.session_state[f"editing_order_{i}"] = False
                                 flash(f"تم تحديث الطلب #{int(r['رقم الطلب'])} بنجاح. المتبقي كاش مطلوب: {new_amount:,.2f} وتم تسجيل مرتجع بـ {return_qty} قطع بانتظار استلامها.")
@@ -861,6 +1184,118 @@ def page_delivery():
             shown = shown.drop(columns=["أُعيد للمخزون"]).iloc[::-1]
             st.dataframe(shown, use_container_width=True, hide_index=True)
             download_buttons(shown, "طلبات_التوصيل", "orders")
+
+
+# =========================
+# طباعة الباركود
+# =========================
+def label_options_ui(prefix):
+    """خيارات شكل الملصق (مشتركة بين صفحة الطباعة ولوحة ما بعد الإضافة)."""
+    c1, c2, c3, c4 = st.columns(4)
+    w = c1.number_input("عرض الملصق (مم)", 20, 200, 50, step=1, key=f"{prefix}_w")
+    h = c2.number_input("ارتفاع الملصق (مم)", 15, 200, 40, step=1, key=f"{prefix}_h")
+    orient = c3.selectbox("اتجاه الباركود", ["أفقي (مثل الصورة)", "عمودي (بالطول)"],
+                          key=f"{prefix}_orient")
+    rot = c4.selectbox("تدوير الملصق عند الطباعة", ["بدون", "90°", "270°"],
+                       key=f"{prefix}_rot",
+                       help="إذا طلعت الطباعة ملفوفة أو بالعرض، جرّب 90° أو 270°.")
+    d1, d2, d3, d4 = st.columns(4)
+    header1 = d1.text_input("سطر علوي (اسم المحل)", "OVVO STORE", key=f"{prefix}_h1")
+    header2 = d2.text_input("سطر ثاني (رقم هاتف مثلًا)", "", key=f"{prefix}_h2")
+    show_price = d3.checkbox("أظهر السعر", value=True, key=f"{prefix}_price")
+    show_meta = d4.checkbox("أظهر اللون والمقاس", value=True, key=f"{prefix}_meta")
+    return {
+        "w": int(w), "h": int(h), "vertical": orient.startswith("عمودي"),
+        "rotate": 0 if rot == "بدون" else int(rot[:-1]),
+        "header1": header1, "header2": header2,
+        "show_price": show_price, "show_meta": show_meta,
+    }
+
+
+def show_just_added():
+    """لوحة الملصق بعد إضافة صنف مباشرة (تُطبع تلقائيًا أول مرة)."""
+    info = st.session_state.get("just_added")
+    if not info:
+        return
+    item = info["item"]
+    with st.container(border=True):
+        st.success(f"تمت إضافة «{item['desc']}» — الباركود {item['barcode']}")
+        with st.expander("شكل ومقاس الملصق"):
+            opts = label_options_ui("add_lbl")
+        components.html(
+            labels_html([(item, info["copies"])], autoprint=info.get("auto", False), **opts),
+            height=320, scrolling=True,
+        )
+        info["auto"] = False
+        if st.button("إغلاق", key="close_just_added"):
+            st.session_state.pop("just_added", None)
+            st.rerun()
+
+
+def page_barcodes():
+    require_admin()
+    page_header("طباعة الباركود", "اختر الأصناف وعدد الملصقات، ثم اضغط «طباعة الملصقات».")
+    if df.empty:
+        st.info("لا توجد أصناف بعد.")
+        return
+
+    filtered = filter_ui(df, "bc", threshold)
+    st.caption(f"يعرض {len(filtered):,} من {len(df):,} صنف")
+    if filtered.empty:
+        st.info("لا نتائج.")
+        return
+
+    layout_label = st.selectbox("نوع الطباعة", ["ملصقات (طابعة باركود)", "ورقة A4"])
+    opts = label_options_ui("bc_lbl")
+
+    k1, k2 = st.columns(2)
+    select_all = k1.checkbox("تحديد كل النتائج", value=False)
+    from_qty = k2.checkbox("عدد الملصقات = كمية الصنف بالمخزون", value=False)
+
+    view = filtered[["الباركود التلقائي", "وصف", "اللون", "المقاس", "الكمية", "سعر البيع"]].copy()
+    view.insert(0, "طباعة", select_all)
+    view["عدد الملصقات"] = qty(filtered).clip(lower=1).astype(int) if from_qty else 1
+
+    edited = st.data_editor(
+        view, hide_index=True, use_container_width=True,
+        disabled=["الباركود التلقائي", "وصف", "اللون", "المقاس", "الكمية", "سعر البيع"],
+        column_config={
+            "طباعة": st.column_config.CheckboxColumn("طباعة"),
+            "الكمية": st.column_config.NumberColumn("الكمية", format="%.0f"),
+            "سعر البيع": st.column_config.NumberColumn("سعر البيع", format="%.2f"),
+            "عدد الملصقات": st.column_config.NumberColumn(
+                "عدد الملصقات", min_value=0, max_value=500, step=1, format="%d"),
+        },
+        key=f"bc_editor_{len(filtered)}_{int(select_all)}_{int(from_qty)}",
+    )
+
+    chosen = edited[edited["طباعة"] & (edited["عدد الملصقات"] > 0)]
+    total = int(chosen["عدد الملصقات"].sum()) if len(chosen) else 0
+    if not len(chosen):
+        st.info("علّم صنفًا واحدًا على الأقل من عمود «طباعة».")
+        return
+    if total > 500:
+        st.error(f"العدد الإجمالي {total} ملصق. الحد الأقصى 500 في المرة الواحدة.")
+        return
+
+    items = []
+    for _, r in chosen.iterrows():
+        items.append((
+            {"barcode": r["الباركود التلقائي"], "desc": r["وصف"], "color": r["اللون"],
+             "size": r["المقاس"], "price": r["سعر البيع"]},
+            int(r["عدد الملصقات"]),
+        ))
+    bad = [it["barcode"] for it, _ in items if not str(it["barcode"]).strip()]
+    if bad:
+        st.warning("بعض الأصناف المحددة ما إلها باركود، وتم تجاهلها.")
+
+    st.caption(f"إجمالي الملصقات: {total:,}")
+    components.html(
+        labels_html(items, layout="a4" if layout_label == "ورقة A4" else "label", **opts),
+        height=520, scrolling=True,
+    )
+    st.caption("اضغط «طباعة الملصقات» داخل المعاينة، واختر الطابعة. "
+               "للطابعة الحرارية: اجعل الهوامش «بدون» وحجم الورق نفس مقاس الملصق.")
 
 
 # =========================
@@ -939,7 +1374,7 @@ def page_reports():
             out_orders = len(orders_rep[orders_rep["الحالة"] == ST_OUT])
             cancelled_orders = len(orders_rep[orders_rep["الحالة"].str.contains("ملغي", na=False)])
             returned_orders = len(orders_rep[orders_rep["الحالة"].str.contains("مرتجع", na=False)])
-            
+
             collected_cash = float(orders_rep[orders_rep["الحالة"] == ST_DELIVERED]["المبلغ المطلوب"].sum())
             pending_cash = float(orders_rep[orders_rep["الحالة"] == ST_OUT]["المبلغ المطلوب"].sum())
 
@@ -1043,6 +1478,8 @@ elif page == "📦 المخزون":
     page_inventory()
 elif page == "➕ إضافة صنف":
     page_add_item()
+elif page == "🏷️ طباعة الباركود":
+    page_barcodes()
 elif page == "🚚 التوصيل":
     page_delivery()
 elif page == "🔎 البحث":
