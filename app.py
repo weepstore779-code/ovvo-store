@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""OVVO Store — نظام إدارة المخزون والمستودعات"""
+"""OVVO storehouse — نظام إدارة المخزون والمستودعات"""
 import base64
 import hashlib
 import hmac
@@ -22,7 +22,7 @@ from PIL import Image, ImageOps
 # =========================
 # إعدادات الصفحة
 # =========================
-st.set_page_config(page_title="OVVO Store", page_icon="📦", layout="wide")
+st.set_page_config(page_title="OVVO storehouse", page_icon="📦", layout="wide")
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 FILE_NAME = os.path.join(BASE_DIR, "OVVO.xlsx")
