@@ -160,11 +160,15 @@ def size_code(size):
     return re.sub(r"\s+", "", s.upper())  # المقاس نفسه هو الكود
 
 
+MODEL_START = 260  # أول رقم موديل
+
+
 def next_model(data):
-    """رقم موديل جديد من 3 أرقام ما بتكرر."""
+    """رقم موديل جديد تسلسلي: أول موديل 260، وبعدها آخر رقم + 1."""
     nums = pd.to_numeric(data["رقم الموديل"], errors="coerce").dropna()
-    nums = nums[(nums >= 0) & (nums <= 998)]
-    return f"{int(nums.max()) + 1:03d}" if len(nums) else "001"
+    nums = nums[(nums >= MODEL_START) & (nums <= 998)]
+    nxt = int(nums.max()) + 1 if len(nums) else MODEL_START
+    return f"{nxt:03d}"
 
 
 def build_barcode(model, color_c, size_c, type_c):
