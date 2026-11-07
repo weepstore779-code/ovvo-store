@@ -9,7 +9,7 @@ import os
 import re
 import secrets
 import shutil
-from datetime import datetime
+from datetime import date, datetime, timedelta
 from io import BytesIO
 
 import numpy as np
@@ -27,6 +27,7 @@ st.set_page_config(page_title="OVVO Store", page_icon="📦", layout="wide")
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 FILE_NAME = os.path.join(BASE_DIR, "OVVO.xlsx")
 ORDERS_FILE = os.path.join(BASE_DIR, "OVVO_orders.xlsx")
+MOVES_FILE = os.path.join(BASE_DIR, "OVVO_movements.xlsx")  # سجل حركات المخزون (تاريخ كل إدخال)
 BANNER_PATH = os.path.join(BASE_DIR, "assets", "ovvo_inventory_banner.png")
 USERS_FILE = os.path.join(BASE_DIR, "ovvo_users.json")
 BACKUP_DIR = os.path.join(BASE_DIR, "backups")
@@ -54,13 +55,15 @@ VISIBLE_COLUMNS = PRIORITY_COLUMNS + [
 
 SEARCH_COLUMNS = ["الباركود التلقائي", "وصف", "وصف 2", "نوع الصنف", "الماركة",
                   "رقم الموديل", "اللون", "المقاس", "كود الصنف"]
-ROLE_LABELS = {"admin": "مدير", "viewer": "مشاهد"}
+ROLE_LABELS = {"admin": "مدير", "viewer": "مشاهد", "accountant": "محاسب"}
+ROLE_BY_LABEL = {v: k for k, v in ROLE_LABELS.items()}
 STATUS_OPTIONS = ["الكل", "متوفر", "منخفض", "نفد"]
 AVAILABLE_NOT_OUT = "المتوفر (عدا النافد)"
 
 # ---- التوصيل ----
 ORDER_COLS = ["رقم الطلب", "التاريخ", "المندوب", "الباركود", "الوصف", "اللون", "المقاس",
-              "الكمية", "سعر البيع", "المبلغ المطلوب", "الحالة", "أُعيد للمخزون"]
+              "الكمية", "سعر البيع", "المبلغ المطلوب", "الحالة", "أُعيد للمخزون",
+              "كلفة الوحدة", "تاريخ الحالة"]
 ST_OUT = "قيد التوصيل"
 ST_DELIVERED = "تم التوصيل"
 ST_RET_WAIT = "مرتجع - بانتظار الاستلام"
@@ -91,6 +94,15 @@ SIZES = ["XXS", "XS", "S", "M", "L", "XL", "XXL", "XXXL",
          "34", "36", "38", "40", "42", "44", "46", "48", "50", "52", "56", "58", "60",
          "فري سايز"]
 FREE_SIZE_CODE = "99"
+# مجموعات مقاسات جاهزة لجدول إضافة الصنف
+SIZE_SETS = {
+    "حروف (S – XXL)": ["S", "M", "L", "XL", "XXL"],
+    "حروف موسّعة (XS – XXXL)": ["XS", "S", "M", "L", "XL", "XXL", "XXXL"],
+    "أرقام (34 – 44)": ["34", "36", "38", "40", "42", "44"],
+    "أرقام (44 – 60)": ["44", "46", "48", "50", "52", "56", "58", "60"],
+    "فري سايز": ["فري سايز"],
+}
+NO_COLOR = "— بدون لون —"
 FREE_ALIASES = {"free", "free size", "freesize", "فري سايز", "فري"}
 
 
@@ -716,6 +728,80 @@ def save_data(data):
     return True
 
 
+# =========================
+# سجل الحركات (تاريخ كل إدخال / تعديل / إخراج)
+# =========================
+MOVE_COLS = ["التاريخ", "نوع الحركة", "رقم الموديل", "الباركود", "الوصف",
+             "اللون", "المقاس", "الكمية", "المستخدم", "ملاحظة"]
+MV_IN = "إدخال"
+MV_ADJ = "تعديل كمية"
+MV_OUT = "إخراج (توصيل)"
+MV_RET = "إرجاع للمخزون"
+MV_DEL = "حذف صنف"
+
+
+def load_moves():
+    empty = pd.DataFrame(columns=MOVE_COLS)
+    if not os.path.isfile(MOVES_FILE):
+        return empty
+    try:
+        m = pd.read_excel(MOVES_FILE, dtype=str)
+    except Exception as e:
+        st.error(f"تعذّرت قراءة سجل الحركات: {e}")
+        return empty
+    for c in MOVE_COLS:
+        if c not in m.columns:
+            m[c] = ""
+        m[c] = m[c].fillna("").astype(str).str.strip()
+    m = m[MOVE_COLS].copy()
+    for c in ("الباركود", "رقم الموديل"):
+        m[c] = m[c].str.replace(r"^(\d+)\.0$", r"\1", regex=True)
+    m["الكمية"] = pd.to_numeric(m["الكمية"], errors="coerce").fillna(0)
+    return m
+
+
+def log_moves(rows):
+    """يضيف حركات لسجل الحركات. فشل السجل ما بيمنع حفظ المخزون، بس بيطلّع تحذير."""
+    if not rows:
+        return True
+    stamp = datetime.now().strftime("%Y-%m-%d %H:%M")
+    user = st.session_state.get("ovvo_username", "")
+    new = []
+    for r in rows:
+        x = {c: "" for c in MOVE_COLS}
+        x.update(r)
+        x["التاريخ"] = r.get("التاريخ") or stamp
+        x["المستخدم"] = r.get("المستخدم") or user
+        new.append(x)
+    new_df = pd.DataFrame(new, columns=MOVE_COLS)
+    tmp = os.path.join(BASE_DIR, "_OVVO_moves_tmp.xlsx")
+    try:
+        old = load_moves()
+        out = new_df if old.empty else pd.concat([old, new_df], ignore_index=True)
+        out.to_excel(tmp, index=False)
+        os.replace(tmp, MOVES_FILE)
+        return True
+    except PermissionError:
+        st.warning("تم حفظ المخزون، لكن تعذّر تسجيل الحركة لأن ملف OVVO_movements.xlsx مفتوح في Excel.")
+    except Exception as e:
+        st.warning(f"تم حفظ المخزون، لكن تعذّر تسجيل الحركة: {e}")
+    finally:
+        if os.path.exists(tmp):
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+    return False
+
+
+def move_row(kind, r, delta, note=""):
+    d = float(delta)
+    d = int(d) if d == int(d) else round(d, 2)
+    return {"نوع الحركة": kind, "رقم الموديل": r["رقم الموديل"],
+            "الباركود": r["الباركود التلقائي"], "الوصف": r["وصف"],
+            "اللون": r["اللون"], "المقاس": r["المقاس"], "الكمية": d, "ملاحظة": note}
+
+
 def next_barcode(data):
     nums = pd.to_numeric(data["الباركود التلقائي"], errors="coerce").dropna()
     return str(int(nums.max()) + 1) if len(nums) else "1001"
@@ -794,24 +880,64 @@ CODE128_PATTERNS = [
 ]
 
 
-def code128_widths(text):
-    vals = [104]  # Start B
+def code128_values(text):
+    """Code128 تلقائي: subset C لتتابعات الأرقام (4 فأكثر)، وB للباقي."""
+    if not text:
+        raise ValueError("empty")
     for ch in text:
-        o = ord(ch)
-        if not 32 <= o <= 126:
+        if not 32 <= ord(ch) <= 126:
             raise ValueError("unsupported character")
-        vals.append(o - 32)
-    chk = (104 + sum(v * i for i, v in enumerate(vals[1:], 1))) % 103
-    vals += [chk, 106]
+    vals, mode = [], None
+    for p in [p for p in re.split(r"(\d{4,})", text) if p]:
+        if p.isdigit() and len(p) >= 4:
+            if len(p) % 2:                      # رقم فردي: أول خانة بـ B
+                if mode is None:
+                    vals.append(104)
+                elif mode == "C":
+                    vals.append(100)
+                mode = "B"
+                vals.append(ord(p[0]) - 32)
+                p = p[1:]
+            if mode is None:
+                vals.append(105)
+            elif mode == "B":
+                vals.append(99)
+            mode = "C"
+            vals += [int(p[i:i + 2]) for i in range(0, len(p), 2)]
+        else:
+            if mode is None:
+                vals.append(104)
+            elif mode == "C":
+                vals.append(100)
+            mode = "B"
+            vals += [ord(c) - 32 for c in p]
+    chk = (vals[0] + sum(v * i for i, v in enumerate(vals[1:], 1))) % 103
+    return vals + [chk, 106]
+
+
+def code128_widths(text):
+    try:
+        vals = code128_values(text)
+    except ValueError:
+        return []
     return [int(c) for c in "".join(CODE128_PATTERNS[v] for v in vals)]
 
 
-def barcode_svg(text, vertical=False):
-    try:
-        widths = code128_widths(text)
-    except ValueError:
+QUIET = 6  # وحدات بيضاء على كل جهة
+
+
+def pick_module(total, avail_mm, dot_mm):
+    """أكبر عرض وحدة = مضاعف صحيح لنقطة الطابعة ويتسع بالمساحة."""
+    for n in (4, 3, 2):
+        if total * n * dot_mm <= avail_mm:
+            return n * dot_mm
+    return avail_mm / total  # ما اتسع: نضغطه (الأفضل تقصير الباركود)
+
+
+def barcode_svg(widths, vertical=False, style=""):
+    if not widths:
         return ""
-    quiet, x, rects = 10, 10, []
+    x, rects = QUIET, []
     for i, w in enumerate(widths):
         if i % 2 == 0:
             if vertical:
@@ -819,11 +945,11 @@ def barcode_svg(text, vertical=False):
             else:
                 rects.append(f'<rect x="{x}" y="0" width="{w}" height="1"/>')
         x += w
-    total = x + quiet
+    total = x + QUIET
     box = f"0 0 1 {total}" if vertical else f"0 0 {total} 1"
     return (f'<svg class="bars" viewBox="{box}" preserveAspectRatio="none" '
-            f'shape-rendering="crispEdges" xmlns="http://www.w3.org/2000/svg">'
-            f'{"".join(rects)}</svg>')
+            f'shape-rendering="crispEdges" style="{style}" '
+            f'xmlns="http://www.w3.org/2000/svg">{"".join(rects)}</svg>')
 
 
 LABEL_CSS = """
@@ -874,10 +1000,12 @@ body{margin:0;padding:8px;font-family:Arial,'Cairo',sans-serif;background:#fff;c
 
 def labels_html(items, w=40, h=30, layout="label", show_price=True,
                 show_meta=True, autoprint=False, vertical=False,
-                header1="", header2="", rotate=0):
+                header1="", header2="", rotate=0, dpi=203):
     """items: قائمة من (dict، عدد النسخ). تُرجع صفحة HTML جاهزة للطباعة.
-    rotate: 0 أو 90 أو 270 (تدوير محتوى الملصق داخل الورقة)."""
+    rotate: 0 أو 90 أو 270 (تدوير محتوى الملصق داخل الورقة).
+    dpi: دقة الطابعة، عشان عرض خط الباركود يكون مضاعف صحيح لنقطة الطابعة."""
     esc = htmllib.escape
+    dot = 25.4 / int(dpi)
     dw, dh = (h, w) if rotate in (90, 270) else (w, h)
     k = max(0.5, min(dw / 50, dh / 30))
     header1, header2 = str(header1).strip(), str(header2).strip()
@@ -894,13 +1022,20 @@ def labels_html(items, w=40, h=30, layout="label", show_price=True,
             p = pd.to_numeric(it.get("price"), errors="coerce")
             if not pd.isna(p) and float(p) > 0:
                 price_txt = f"{float(p):,.2f}"
-        svg = barcode_svg(code, vertical=vertical)
+        widths = code128_widths(code)
+        total = (sum(widths) + 2 * QUIET) if widths else 0
         desc_txt = esc(str(it.get("desc", "")))
         hd = ((f'<div class="hd">{esc(header1)}</div>' if header1 else "")
               + (f'<div class="hd2">{esc(header2)}</div>' if header2 else ""))
         meta_html = f'<div class="meta">{esc(meta)}</div>' if show_meta and meta else ""
         price_html = f'<div class="price">{price_txt}</div>' if price_txt else ""
         if vertical:
+            svg = ""
+            if widths:
+                length = total * pick_module(total, dh - 3.0, dot)
+                svg = barcode_svg(
+                    widths, True,
+                    f"height:{length:.3f}mm;top:50%;margin-top:-{length / 2:.3f}mm")
             inner = (
                 f'<div class="lin vert{rot_cls}">'
                 '<div class="vbar">' + (svg or '<div class="bars"></div>')
@@ -915,11 +1050,16 @@ def labels_html(items, w=40, h=30, layout="label", show_price=True,
                      + 3.0 * k + (2.6 * k if meta_html else 0) + 2.6 * k
                      + (3.6 * k if price_html else 0))
             bar_h = max(5.0, dh - 2.4 - lines * 1.22 - 3.0)
+            if widths:
+                mod = pick_module(total, dw - 3.0, dot)
+                svg = barcode_svg(
+                    widths, False,
+                    f"width:{total * mod:.3f}mm;height:{bar_h:.1f}mm;margin:.5mm auto")
+            else:
+                svg = f'<div class="bars" style="height:{bar_h:.1f}mm"></div>'
             inner = (
                 f'<div class="lin{rot_cls}">' + hd
-                + f'<div class="desc">{desc_txt}</div>' + meta_html
-                + (svg.replace('class="bars"', f'class="bars" style="height:{bar_h:.1f}mm"')
-                   if svg else f'<div class="bars" style="height:{bar_h:.1f}mm"></div>')
+                + f'<div class="desc">{desc_txt}</div>' + meta_html + svg
                 + f'<div class="code">{esc(code)}</div>' + price_html + "</div>"
             )
         labels.extend([f'<div class="label">{inner}</div>'] * int(copies))
@@ -1014,10 +1154,14 @@ with st.sidebar:
         f'<span style="color:#D6C1A3;font-size:13px;">{ROLE_LABELS.get(current_role, "")}</span></div>',
         unsafe_allow_html=True,
     )
-    pages = ["🏠 الرئيسية", "📦 المخزون", "🔎 البحث", "📑 التقارير والطباعة"]
+    pages = ["🏠 الرئيسية", "📦 المخزون", "🔎 البحث", "📋 كشف المواد", "📑 التقارير والطباعة"]
+    if current_role == "accountant":
+        pages = ["🏠 الرئيسية", "💰 كلف المنتجات", "🧮 المحاسبة", "📦 المخزون",
+                 "🔎 البحث", "📋 كشف المواد", "📑 التقارير والطباعة"]
     if current_role == "admin":
         pages = ["🏠 الرئيسية", "📦 المخزون", "➕ إضافة صنف", "🏷️ طباعة الباركود",
-                 "🚚 التوصيل", "🔎 البحث", "📑 التقارير والطباعة", "👤 إدارة المستخدمين"]
+                 "🚚 التوصيل", "🔎 البحث", "📋 كشف المواد", "📑 التقارير والطباعة",
+                 "👤 إدارة المستخدمين"]
     page = st.radio("القائمة", pages, label_visibility="collapsed", key="nav")
     st.markdown('<div class="tagline">MORE THAN JUST<br>A STORE<div></div></div>', unsafe_allow_html=True)
     if st.button("🚪 تسجيل الخروج", use_container_width=True):
@@ -1261,7 +1405,18 @@ def page_inventory():
         if len(dups):
             st.error("لا يمكن الحفظ: باركود مكرر → " + "، ".join(dups[:5]))
             return
+        old_q = qty(df).loc[changes.index]
+        new_q = pd.to_numeric(changes["الكمية"], errors="coerce").fillna(0)
+        log = []
+        for i in changes.index:
+            if i in to_delete:
+                if old_q[i]:
+                    log.append(move_row(MV_DEL, df.loc[i], -old_q[i], "حذف من جدول التعديل"))
+            elif new_q[i] != old_q[i]:
+                log.append(move_row(MV_ADJ, df.loc[i], new_q[i] - old_q[i],
+                                    "تعديل من صفحة المخزون"))
         if save_data(base):
+            log_moves(log)
             msg = "تم حفظ التعديلات."
             if len(to_delete):
                 msg += f" وحُذف {len(to_delete)} صنف."
@@ -1274,7 +1429,7 @@ def page_inventory():
 # =========================
 def label_options_ui(prefix):
     """خيارات شكل الملصق (مشتركة بين صفحة الطباعة ولوحة ما بعد الإضافة). الافتراضي 40×30 مم."""
-    c1, c2, c3, c4 = st.columns(4)
+    c1, c2, c3, c4, c5 = st.columns(5)
     w = c1.number_input("عرض الملصق (مم)", 20, 200, 40, step=1, key=f"{prefix}_w")
     h = c2.number_input("ارتفاع الملصق (مم)", 15, 200, 30, step=1, key=f"{prefix}_h")
     orient = c3.selectbox("اتجاه الباركود", ["أفقي (مثل الصورة)", "عمودي (بالطول)"],
@@ -1282,6 +1437,8 @@ def label_options_ui(prefix):
     rot = c4.selectbox("تدوير الملصق عند الطباعة", ["بدون", "90°", "270°"],
                        key=f"{prefix}_rot",
                        help="إذا طلعت الطباعة ملفوفة أو بالعرض، جرّب 90° أو 270°.")
+    dpi = c5.selectbox("دقة الطابعة (DPI)", [203, 300], key=f"{prefix}_dpi",
+                       help="أغلب طابعات الملصقات 203. بتلاقيها مكتوبة على الطابعة أو بالمواصفات.")
     d1, d2, d3, d4 = st.columns(4)
     header1 = d1.text_input("سطر علوي (اسم المحل)", "OVVO STORE", key=f"{prefix}_h1")
     header2 = d2.text_input("سطر ثاني (رقم هاتف مثلًا)", "", key=f"{prefix}_h2")
@@ -1291,7 +1448,7 @@ def label_options_ui(prefix):
         "w": int(w), "h": int(h), "vertical": orient.startswith("عمودي"),
         "rotate": 0 if rot == "بدون" else int(rot[:-1]),
         "header1": header1, "header2": header2,
-        "show_price": show_price, "show_meta": show_meta,
+        "show_price": show_price, "show_meta": show_meta, "dpi": int(dpi),
     }
 
 
@@ -1314,8 +1471,6 @@ def show_just_added():
         if st.button("إغلاق", key="close_just_added"):
             st.session_state.pop("just_added", None)
             st.rerun()
-
-
 # =========================
 # إضافة صنف
 # =========================
@@ -1335,15 +1490,32 @@ def page_add_item():
     def clean(v):
         return "" if v is None or pd.isna(v) else str(v).strip()
 
-    # ألوان/مقاسات جديدة (خارج الفورم عشان تظهر فورًا في الجدول)
-    st.markdown("#### ألوان أو مقاسات جديدة (اختياري)")
+    # ---- اختيار ألوان/مقاسات الجدول (خارج الفورم عشان الجدول يتحدّث فورًا) ----
+    st.markdown("#### جدول الألوان والمقاسات")
     n1, n2 = st.columns(2)
     new_colors = split_names(n1.text_input(
-        "ألوان جديدة (افصل بينها بفاصلة)", key=f"nc_{form_id}"))
+        "لون جديد مش موجود بالجدول؟ (افصل بينها بفاصلة)", key=f"nc_{form_id}"))
     new_sizes = split_names(n2.text_input(
-        "مقاسات جديدة (افصل بينها بفاصلة)", key=f"ns_{form_id}"))
-    color_opts = known_names("colors", new_colors)
-    size_opts = SIZES + [s for s in new_sizes if s not in SIZES]
+        "مقاس جديد مش موجود؟ (افصل بينها بفاصلة)", key=f"ns_{form_id}"))
+    all_colors = known_names("colors", new_colors)
+    all_sizes = SIZES + [x for x in new_sizes if x not in SIZES]
+
+    s1, s2 = st.columns([1, 2])
+    size_set = s1.radio("مجموعة المقاسات", list(SIZE_SETS), key=f"sset_{form_id}")
+    grid_sizes = s2.multiselect(
+        "المقاسات بالجدول", all_sizes,
+        default=[x for x in all_sizes if x in SIZE_SETS[size_set] or x in new_sizes],
+        key=f"gs_{form_id}_{size_set}_{'|'.join(new_sizes)}")
+    grid_colors = st.multiselect(
+        "الألوان بالجدول (شيل اللي ما بدك ياه)", all_colors, default=all_colors,
+        key=f"gc_{form_id}_{'|'.join(new_colors)}")
+    if not grid_sizes:
+        st.warning("اختر مقاسًا واحدًا على الأقل لعرض الجدول.")
+        return
+    grid_rows = grid_colors + [NO_COLOR]
+    grid_df = pd.DataFrame(0, index=range(len(grid_rows)), columns=grid_sizes)
+    grid_df.insert(0, "اللون", grid_rows)
+    grid_sig = hashlib.md5("|".join(grid_rows + ["#"] + grid_sizes).encode("utf-8")).hexdigest()[:8]
 
     with st.form(f"add_item_form_{form_id}"):
         st.markdown("#### بيانات الصنف")
@@ -1361,20 +1533,16 @@ def page_add_item():
             help="اتركه فارغًا لتوليد رقم جديد. اكتب رقم موديل موجود "
                  "لإضافة ألوان/مقاسات جديدة عليه.")
 
-        st.markdown("#### الألوان والمقاسات والكميات *")
-        st.caption("كل سطر = لون + مقاس + كمية. اضغط على آخر الجدول لإضافة سطر جديد، "
-                   "ومثال: أسود / M / 3 ثم أسود / L / 3 ثم أحمر / S / 6.")
-        variants_df = st.data_editor(
-            pd.DataFrame([{"اللون": None, "المقاس": None, "الكمية": 1}]),
-            num_rows="dynamic", hide_index=True, use_container_width=True,
-            column_config={
-                "اللون": st.column_config.SelectboxColumn("اللون", options=color_opts),
-                "المقاس": st.column_config.SelectboxColumn("المقاس", options=size_opts),
-                "الكمية": st.column_config.NumberColumn(
-                    "الكمية", min_value=0, step=1, default=1, format="%d"),
-            },
-            key=f"variants_{form_id}",
-        )
+        st.markdown("#### الكميات *")
+        st.caption("اكتب الكمية بالخانة المناسبة (لون × مقاس). الخانات اللي بتضل صفر "
+                   "ما بتنحفظ، فما في داعي تدخل اللون أو المقاس.")
+        grid_cfg = {"اللون": st.column_config.TextColumn("اللون", disabled=True)}
+        for sz in grid_sizes:
+            grid_cfg[sz] = st.column_config.NumberColumn(
+                sz, min_value=0, step=1, default=0, format="%d")
+        grid_edit = st.data_editor(
+            grid_df, num_rows="fixed", hide_index=True, use_container_width=True,
+            column_config=grid_cfg, key=f"grid_{form_id}_{grid_sig}")
 
         st.markdown("#### الأسعار")
         c1, c2, c3 = st.columns(3)
@@ -1431,19 +1599,19 @@ def page_add_item():
         return
 
     variants = []
-    for _, r in variants_df.iterrows():
-        color, size = clean(r.get("اللون")), clean(r.get("المقاس"))
-        if not color and not size:
-            continue  # سطر فاضي
-        q = pd.to_numeric(r.get("الكمية"), errors="coerce")
-        q = 0 if pd.isna(q) else int(q)
-        if q <= 0:
-            st.error(f"الكمية لازم تكون أكبر من صفر (اللون: {color or '—'}، المقاس: {size or '—'}).")
-            return
-        variants.append((color, size, q))
+    for _, r in grid_edit.iterrows():
+        color = "" if r["اللون"] == NO_COLOR else str(r["اللون"]).strip()
+        for sz in grid_sizes:
+            q = pd.to_numeric(r[sz], errors="coerce")
+            if pd.isna(q) or q == 0:
+                continue  # صفر = اللون/المقاس مش موجود
+            if q < 0 or q != int(q):
+                st.error(f"الكمية لازم تكون رقم صحيح موجب (اللون: {color or '—'}، المقاس: {sz}).")
+                return
+            variants.append((color, sz, int(q)))
 
     if not variants:
-        st.error("أضف سطر واحد على الأقل (لون و/أو مقاس مع الكمية).")
+        st.error("ما في كمية مدخلة. اكتب كمية أكبر من صفر بخانة وحدة على الأقل بالجدول.")
         return
 
     seen = set()
@@ -1498,6 +1666,14 @@ def page_add_item():
     # ---------- الحفظ (مرة وحدة لكل الأسطر) ----------
     updated = pd.concat([df, pd.DataFrame(new_rows)], ignore_index=True)
     if save_data(updated):
+        note = " | ".join(x for x in [
+            f"فاتورة {invoice.strip()}" if invoice.strip() else "",
+            f"طلبية {order.strip()}" if order.strip() else ""] if x) or "إدخال جديد"
+        log_moves([{
+            "نوع الحركة": MV_IN, "رقم الموديل": model, "الباركود": r["الباركود التلقائي"],
+            "الوصف": desc.strip(), "اللون": r["اللون"], "المقاس": r["المقاس"],
+            "الكمية": r["الكمية"], "ملاحظة": note,
+        } for r in new_rows])
         if photo:
             save_model_image(model, photo)
         st.session_state["just_added"] = {
@@ -1544,8 +1720,8 @@ def save_orders(o):
     return False
 
 
-def adjust_stock_many(changes):
-    """changes = {barcode: delta}. يتحقق من الكل أولًا ثم يحفظ مرة وحدة."""
+def adjust_stock_many(changes, note=""):
+    """changes = {barcode: delta}. يتحقق من الكل أولًا ثم يحفظ مرة وحدة ويسجّل الحركة."""
     data, _ = load_data()
     rows = {}
     for code, delta in changes.items():
@@ -1558,19 +1734,26 @@ def adjust_stock_many(changes):
             st.error(f"الكمية غير كافية للباركود {code}.")
             return False
         rows[i] = delta
+    log = []
     for i, delta in rows.items():
+        if delta:
+            log.append(move_row(MV_OUT if delta < 0 else MV_RET, data.loc[i], delta, note))
         data.loc[i, "الكمية"] = float(data.loc[i, "الكمية"]) + delta
-    return save_data(data)
+    if save_data(data):
+        log_moves(log)
+        return True
+    return False
 
 
-def adjust_stock(barcode, delta):
-    return adjust_stock_many({barcode: delta})
+def adjust_stock(barcode, delta, note=""):
+    return adjust_stock_many({barcode: delta}, note)
 
 
 def update_order(orders, i, status, restock=False):
     row = orders.loc[i]
     if restock and not row["أُعيد للمخزون"]:
-        if not adjust_stock(row["الباركود"], float(row["الكمية"])):
+        if not adjust_stock(row["الباركود"], float(row["الكمية"]),
+                            f"إرجاع طلب رقم {int(row['رقم الطلب'])}"):
             return
         orders.loc[i, "أُعيد للمخزون"] = True
     orders.loc[i, "الحالة"] = status
@@ -1655,7 +1838,7 @@ def page_delivery():
                 changes = {}
                 for x in lines:
                     changes[x["code"]] = changes.get(x["code"], 0) - x["qty"]
-                if adjust_stock_many(changes):
+                if adjust_stock_many(changes, "شحنة مع مندوب"):
                     new_id = int(orders["رقم الطلب"].max()) + 1 if len(orders) else 1
                     stamp = datetime.now().strftime("%Y-%m-%d %H:%M")
                     rows = [{
@@ -1673,7 +1856,8 @@ def page_delivery():
                         flash(f"تم إنشاء الشحنة رقم {new_id} ({total_pcs} قطعة) وخصمها من المخزون.")
                         st.rerun()
                     else:  # تراجع عن الخصم إذا فشل حفظ الطلبات
-                        adjust_stock_many({k: -v for k, v in changes.items()})
+                        adjust_stock_many({k: -v for k, v in changes.items()},
+                                          "تراجع عن شحنة (فشل حفظ الطلبات)")
 
     # ---------------- الشحنات المفتوحة ----------------
     with tab_open:
@@ -1764,7 +1948,7 @@ def page_delivery():
             m3.metric("📦 عدد الشحنات", int(orders["رقم الطلب"].nunique()))
             f = st.selectbox("الحالة", ["الكل"] + sorted(orders["الحالة"].unique()), key="ord_f")
             shown = orders if f == "الكل" else orders[orders["الحالة"] == f]
-            shown = shown.drop(columns=["أُعيد للمخزون"]).iloc[::-1]
+            shown = shown.drop(columns=["أُعيد للمخزون", "كلفة الوحدة"]).iloc[::-1]
             st.dataframe(shown, use_container_width=True, hide_index=True)
             download_buttons(shown, "طلبات_التوصيل", "orders")
 
@@ -1858,6 +2042,305 @@ def page_search():
 
 
 # =========================
+# كشف المواد (مختصر / تفصيلي)
+# =========================
+def _model_sort_key(m):
+    m = str(m)
+    return (0, int(m), "") if m.isdigit() else (1, 0, m)
+
+
+def _fmt_q(x):
+    x = float(x)
+    return f"{int(x):,}" if x == int(x) else f"{x:,.2f}"
+
+
+def build_statement(data, moves, detailed, d_from=None, d_to=None, term="", hide_out=False,
+                    breakdown=False):
+    """يرجّع (blocks, flat). blocks = قائمة موديلات، flat = جدول مسطّح للتنزيل."""
+    d = data.copy()
+    d["_q"] = qty(d)
+    d["_m"] = d["رقم الموديل"].replace("", "بدون موديل")
+
+    mv = moves.copy()
+    if not mv.empty:
+        mv["_m"] = mv["رقم الموديل"].replace("", "بدون موديل")
+        bar_model = dict(zip(d["الباركود التلقائي"], d["_m"]))
+        mv["_m"] = [bar_model.get(b, m) for b, m in zip(mv["الباركود"], mv["_m"])]
+    else:
+        mv["_m"] = []
+
+    date_filter = d_from is not None and d_to is not None
+    if date_filter and not mv.empty:
+        ds = mv["التاريخ"].str[:10]
+        mv = mv[(ds >= d_from.isoformat()) & (ds <= d_to.isoformat())]
+
+    words = term.lower().split()
+    blocks = []
+    for model in sorted(d["_m"].unique(), key=_model_sort_key):
+        g = d[d["_m"] == model]
+        descs = [x for x in g["وصف"] if x]
+        desc = descs[0] if descs else ""
+        total = float(g["_q"].sum())
+        hay = " ".join([str(model), desc, *g["نوع الصنف"].unique(), *g["الماركة"].unique()]).lower()
+        if words and not all(w in hay for w in words):
+            continue
+        if hide_out and total <= 0:
+            continue
+
+        rows = []
+        if detailed:
+            ev = mv[mv["_m"] == model]
+            if not date_filter:
+                # رصيد الأصناف قبل بدء السجل (ما إله تاريخ مسجّل)
+                logged = mv.groupby("الباركود")["الكمية"].sum().to_dict() if not mv.empty else {}
+                for _, r in g.iterrows():
+                    opening = float(r["_q"]) - float(logged.get(r["الباركود التلقائي"], 0))
+                    if abs(opening) > 1e-9:
+                        rows.append({"date": "", "type": "رصيد سابق", "color": r["اللون"],
+                                     "size": r["المقاس"], "qty": opening, "signed": False,
+                                     "barcode": r["الباركود التلقائي"], "user": "", "note": ""})
+            for _, r in ev.sort_values("التاريخ", kind="stable").iterrows():
+                rows.append({"date": r["التاريخ"], "type": r["نوع الحركة"], "color": r["اللون"],
+                             "size": r["المقاس"], "qty": float(r["الكمية"]), "signed": True,
+                             "barcode": r["الباركود"], "user": r["المستخدم"], "note": r["ملاحظة"]})
+            if not breakdown:
+                grouped = {}
+                for r in rows:
+                    k = (r["date"], r["type"], r["user"], r["note"], r["signed"])
+                    if k in grouped:
+                        grouped[k]["qty"] += r["qty"]
+                    else:
+                        grouped[k] = {**r, "color": "", "size": "", "barcode": ""}
+                rows = list(grouped.values())
+            if date_filter and not rows:
+                continue
+        blocks.append({"model": model, "desc": desc, "total": total, "rows": rows})
+
+    if detailed and not breakdown:
+        flat_rows = [{
+            "رقم الموديل": b["model"], "الوصف": b["desc"],
+            "التاريخ": r["date"] or "قبل السجل", "الحركة": r["type"],
+            "الكمية": int(r["qty"]) if r["qty"] == int(r["qty"]) else r["qty"],
+            "المستخدم": r["user"], "ملاحظة": r["note"]}
+            for b in blocks for r in b["rows"]]
+        flat = pd.DataFrame(flat_rows, columns=[
+            "رقم الموديل", "الوصف", "التاريخ", "الحركة", "الكمية", "المستخدم", "ملاحظة"])
+    elif detailed:
+        flat_rows = []
+        for b in blocks:
+            for r in b["rows"]:
+                flat_rows.append({
+                    "رقم الموديل": b["model"], "الوصف": b["desc"],
+                    "التاريخ": r["date"] or "قبل السجل", "الحركة": r["type"],
+                    "اللون": r["color"], "المقاس": r["size"],
+                    "الكمية": int(r["qty"]) if r["qty"] == int(r["qty"]) else r["qty"],
+                    "الباركود": r["barcode"], "المستخدم": r["user"], "ملاحظة": r["note"]})
+        flat = pd.DataFrame(flat_rows, columns=[
+            "رقم الموديل", "الوصف", "التاريخ", "الحركة", "اللون", "المقاس",
+            "الكمية", "الباركود", "المستخدم", "ملاحظة"])
+    else:
+        flat = pd.DataFrame(
+            [{"رقم الموديل": b["model"], "الوصف": b["desc"], "الكمية": int(round(b["total"]))}
+             for b in blocks], columns=["رقم الموديل", "الوصف", "الكمية"])
+    return blocks, flat
+
+
+STATEMENT_CSS = """
+body{font-family:Cairo,Tahoma,Arial,sans-serif;direction:rtl;margin:0;padding:14px;color:#1E2633;background:#fff}
+.bar{display:flex;gap:12px;align-items:center;margin-bottom:12px}
+.bar button{font-family:inherit;font-weight:700;padding:8px 18px;border-radius:10px;
+  border:1px solid #0D1B2E;background:#fff;cursor:pointer}
+.head{border-bottom:2px solid #0D1B2E;margin-bottom:10px;padding-bottom:6px}
+.head h1{margin:0;font-size:20px}
+.head p{margin:2px 0 0;color:#555;font-size:13px}
+table{width:100%;border-collapse:collapse;font-size:13px;margin-bottom:6px}
+th{background:#0D1B2E;color:#fff;padding:5px 8px;text-align:right}
+td{border-bottom:1px solid #ddd;padding:4px 8px;text-align:right}
+tfoot td{font-weight:800;background:#f3ece1;border-top:2px solid #0D1B2E}
+tr{break-inside:avoid}
+.model{margin:14px 0 4px;break-inside:auto}
+.mh{background:#f3ece1;border:1px solid #d9c9ad;padding:6px 10px;font-weight:700;
+  display:flex;justify-content:space-between;break-after:avoid}
+.num{font-variant-numeric:tabular-nums}
+.dim{color:#888}
+.pos{color:#1b7a3a;font-weight:700}.neg{color:#b3261e;font-weight:700}
+@media print{.bar{display:none}body{padding:0}thead{display:table-header-group}}
+"""
+
+
+def statement_html(blocks, detailed, subtitle="", breakdown=False):
+    e = htmllib.escape
+    now = datetime.now().strftime("%Y-%m-%d %H:%M")
+    user = st.session_state.get("ovvo_username", "")
+    kind = "تفصيلي" if detailed else "مختصر"
+    grand = sum(b["total"] for b in blocks)
+    out = [f'<!doctype html><html lang="ar" dir="rtl"><head><meta charset="utf-8">'
+           f'<style>{STATEMENT_CSS}</style></head><body>',
+           f'<div class="bar"><button onclick="window.print()">🖨️ طباعة الكشف</button>'
+           f'<span>{len(blocks)} موديل</span></div>',
+           f'<div class="head"><h1>OVVO STORE — كشف المواد ({kind})</h1>'
+           f'<p>تاريخ الطباعة: {e(now)}'
+           f'{" — المستخدم: " + e(user) if user else ""}'
+           f'{" — " + e(subtitle) if subtitle else ""}</p></div>']
+
+    if not blocks:
+        out.append("<p>لا توجد نتائج.</p></body></html>")
+        return "".join(out)
+
+    if not detailed:
+        out.append("<table><thead><tr><th>#</th><th>رقم الموديل</th><th>الوصف</th>"
+                   "<th>الكمية</th></tr></thead><tbody>")
+        for n, b in enumerate(blocks, 1):
+            out.append(f'<tr><td class="dim">{n}</td><td>{e(str(b["model"]))}</td>'
+                       f'<td>{e(b["desc"])}</td><td class="num">{_fmt_q(b["total"])}</td></tr>')
+        out.append(f'</tbody><tfoot><tr><td colspan="3">الإجمالي ({len(blocks)} موديل)</td>'
+                   f'<td class="num">{_fmt_q(grand)}</td></tr></tfoot></table>')
+    else:
+        for b in blocks:
+            heads = (["التاريخ", "الحركة", "اللون", "المقاس", "الكمية", "الباركود", "المستخدم", "ملاحظة"]
+                     if breakdown else ["التاريخ", "الحركة", "الكمية", "المستخدم", "ملاحظة"])
+            out.append(f'<div class="model"><div class="mh"><span>موديل {e(str(b["model"]))}'
+                       f' — {e(b["desc"])}</span><span>الكمية الحالية: {_fmt_q(b["total"])} حبة</span></div>'
+                       '<table><thead><tr>' + "".join(f"<th>{h}</th>" for h in heads) + '</tr></thead><tbody>')
+            if not b["rows"]:
+                out.append(f'<tr><td colspan="{len(heads)}" class="dim">لا توجد حركات مسجّلة.</td></tr>')
+            for r in b["rows"]:
+                q = r["qty"]
+                if r["signed"]:
+                    cls = "pos" if q > 0 else "neg" if q < 0 else ""
+                    qtxt = f'<span dir="ltr" class="{cls}">{"+" if q > 0 else ""}{_fmt_q(q)}</span>'
+                else:
+                    qtxt = f'<span dir="ltr">{_fmt_q(q)}</span>'
+                if not breakdown:
+                    qtxt += " حبة"
+                date_td = f'<td class="num">{e(r["date"]) or "<span class=dim>قبل السجل</span>"}</td>'
+                if breakdown:
+                    out.append(
+                        f'<tr>{date_td}<td>{e(r["type"])}</td><td>{e(r["color"]) or "—"}</td>'
+                        f'<td>{e(r["size"]) or "—"}</td><td class="num">{qtxt}</td>'
+                        f'<td class="num">{e(r["barcode"])}</td><td>{e(r["user"])}</td>'
+                        f'<td>{e(r["note"])}</td></tr>')
+                else:
+                    out.append(
+                        f'<tr>{date_td}<td>{e(r["type"])}</td><td class="num">{qtxt}</td>'
+                        f'<td>{e(r["user"])}</td><td>{e(r["note"])}</td></tr>')
+            out.append("</tbody></table></div>")
+        out.append(f'<table><tfoot><tr><td>الإجمالي الحالي ({len(blocks)} موديل)</td>'
+                   f'<td class="num" style="width:120px">{_fmt_q(grand)}</td></tr></tfoot></table>')
+    out.append("</body></html>")
+    return "".join(out)
+
+
+def page_statement():
+    page_header("كشف المواد",
+                "كشف مختصر (رقم الموديل، الوصف، الكمية) أو تفصيلي مع تاريخ كل إدخال وحركة. اطبعه أو نزّله.")
+    if df.empty:
+        st.info("لا توجد أصناف بعد.")
+        return
+
+    c1, c2, c3 = st.columns([1.2, 1.8, 1.2])
+    kind = c1.radio("نوع الكشف", ["مختصر", "تفصيلي"], horizontal=True, key="stm_kind")
+    term = c2.text_input("بحث برقم الموديل أو الوصف", key="stm_q")
+    hide_out = c3.checkbox("إخفاء الموديلات النافدة", key="stm_hide")
+    detailed = kind == "تفصيلي"
+
+    d_from = d_to = None
+    subtitle = ""
+    breakdown = False
+    moves = load_moves()
+    if detailed:
+        breakdown = st.checkbox("إظهار تفاصيل الألوان والمقاسات لكل إدخال", key="stm_break")
+        use_dates = st.checkbox("تحديد فترة زمنية", key="stm_dates")
+        if use_dates:
+            f1, f2 = st.columns(2)
+            d_from = f1.date_input("من تاريخ", value=date.today() - timedelta(days=30), key="stm_from")
+            d_to = f2.date_input("إلى تاريخ", value=date.today(), key="stm_to")
+            if d_from > d_to:
+                st.error("تاريخ البداية بعد تاريخ النهاية.")
+                return
+            subtitle = f"الفترة: {d_from.isoformat()} إلى {d_to.isoformat()}"
+        if moves.empty:
+            st.info("سجل الحركات بيبدأ من هالتحديث: الأصناف الموجودة من قبل بتظهر كـ«رصيد سابق» "
+                    "بدون تاريخ، وكل إدخال أو تعديل جديد بيتسجّل بتاريخه ووقته.")
+
+    blocks, flat = build_statement(df, moves, detailed, d_from, d_to, term, hide_out, breakdown)
+    if not blocks:
+        st.info("لا توجد نتائج مطابقة.")
+        return
+    st.caption(f"عدد الموديلات: {len(blocks):,} — إجمالي القطع الحالية: "
+               f"{sum(b['total'] for b in blocks):,.0f}")
+    components.html(statement_html(blocks, detailed, subtitle, breakdown), height=640, scrolling=True)
+    download_buttons(flat, f"كشف_المواد_{kind}", "stmt")
+
+
+# =========================
+# تقرير المخزون الكامل (مختصر بالموديل / تفصيلي بالألوان والمقاسات)
+# =========================
+MODEL_INFO_COLUMNS = ["الوصف", "وصف 2", "نوع الصنف", "الماركة", "المنشاة", "الموسم",
+                      "سنة الشراء", "الطلبية", "فاتورة رقم", "محجب او غير محجب",
+                      "كت او كم او نص كم", "كود الصنف", "سعر البيع", "سعر البيع 2", "ضريبة"]
+
+
+def stock_report_tables(data):
+    """يرجّع (مختصر، تفصيلي). المختصر سطر لكل موديل بكل معلوماته بدون ألوان ومقاسات."""
+    d = data.copy()
+    d["_q"] = qty(d)
+    d["_key"] = [m if m else f"بدون موديل #{b}" for m, b in zip(d["رقم الموديل"], d["الباركود التلقائي"])]
+    rows = []
+    for key in sorted(d["_key"].unique(), key=_model_sort_key):
+        g = d[d["_key"] == key]
+        r = {"رقم الموديل": key if g["رقم الموديل"].iloc[0] else "بدون موديل"}
+        for c in MODEL_INFO_COLUMNS:
+            col = "وصف" if c == "الوصف" else c
+            vals = g[col]
+            if col in NUM_COLUMNS:
+                vals = vals.dropna()
+                r[c] = vals.iloc[0] if len(vals) else ""
+            else:
+                vals = [v for v in vals if v]
+                r[c] = vals[0] if vals else ""
+        r["الكمية"] = int(round(float(g["_q"].sum())))
+        rows.append(r)
+    cols = ["رقم الموديل"] + MODEL_INFO_COLUMNS[:12] + ["سعر البيع", "سعر البيع 2", "ضريبة", "الكمية"]
+    cols = list(dict.fromkeys(cols))
+    summary = pd.DataFrame(rows, columns=cols)
+
+    det = d.assign(_s=[size_key(x) for x in d["المقاس"]])
+    det = det.sort_values(by=["_key", "اللون", "_s"],
+                          key=lambda c: c.map(_model_sort_key) if c.name == "_key" else c,
+                          kind="stable")
+    det_cols = ["رقم الموديل"] + [c for c in VISIBLE_COLUMNS if c != "رقم الموديل"]
+    detailed = det[det_cols].reset_index(drop=True)
+    return summary, detailed
+
+
+def table_print_html(data, title, subtitle=""):
+    e = htmllib.escape
+    now = datetime.now().strftime("%Y-%m-%d %H:%M")
+
+    def cell(v):
+        if v is None or (isinstance(v, float) and pd.isna(v)):
+            return ""
+        if isinstance(v, (int, float, np.integer, np.floating)):
+            return _fmt_q(v)
+        return e(str(v))
+
+    head = "".join(f"<th>{e(str(c))}</th>" for c in data.columns)
+    body = "".join(
+        "<tr>" + "".join(f"<td>{cell(v)}</td>" for v in row) + "</tr>"
+        for row in data.itertuples(index=False, name=None))
+    return (
+        f'<!doctype html><html lang="ar" dir="rtl"><head><meta charset="utf-8">'
+        f'<style>{STATEMENT_CSS}@page{{size:landscape;margin:8mm}}'
+        f'table{{font-size:11px}}</style></head><body>'
+        f'<div class="bar"><button onclick="window.print()">🖨️ طباعة</button>'
+        f'<span>{len(data):,} سطر</span></div>'
+        f'<div class="head"><h1>OVVO STORE — {e(title)}</h1>'
+        f'<p>تاريخ الطباعة: {e(now)}{" — " + e(subtitle) if subtitle else ""}</p></div>'
+        f'<table><thead><tr>{head}</tr></thead><tbody>{body}</tbody></table></body></html>')
+
+
+# =========================
 # التقارير والطباعة
 # =========================
 def page_reports():
@@ -1899,9 +2382,33 @@ def page_reports():
             download_buttons(shown, "اصناف_تحتاج_توريد", "need")
 
     with tab3:
-        shown = full[display_columns(current_role)]
-        st.dataframe(style_status(shown), use_container_width=True, hide_index=True)
-        download_buttons(shown, "المخزون_الكامل", "full")
+        summary_t, detailed_t = stock_report_tables(df)
+        rt1, rt2 = st.columns([1.3, 2])
+        rkind = rt1.radio("نوع التقرير", ["مختصر (حسب الموديل)", "تفصيلي (بالألوان والمقاسات)"],
+                          key="full_kind")
+        is_short = rkind.startswith("مختصر")
+        table = summary_t if is_short else detailed_t
+        title = "المخزون الكامل — " + ("مختصر حسب الموديل" if is_short else "تفصيلي")
+        stamp = datetime.now().strftime("%Y-%m-%d")
+        b1, b2, b3, _ = st.columns([1, 1, 1, 2])
+        b1.download_button(
+            "⬇️ Excel", to_excel_bytes(table), f"المخزون_{'مختصر' if is_short else 'تفصيلي'}_{stamp}.xlsx",
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key="full_xlsx", use_container_width=True)
+        b2.download_button(
+            "⬇️ CSV", table.to_csv(index=False).encode("utf-8-sig"),
+            f"المخزون_{'مختصر' if is_short else 'تفصيلي'}_{stamp}.csv", "text/csv",
+            key="full_csv", use_container_width=True)
+        show_print = b3.toggle("🖨️ معاينة وطباعة", key="full_print")
+        if is_short:
+            st.caption(f"{len(table):,} موديل — إجمالي القطع {int(table['الكمية'].sum()):,}. "
+                       "كل موديل بسطر واحد بكل معلوماته بدون تجزئة للألوان والمقاسات.")
+        else:
+            st.caption(f"{len(table):,} سطر (لون/مقاس) بكل المعلومات المدخلة.")
+        if show_print:
+            components.html(table_print_html(table, title), height=640, scrolling=True)
+        else:
+            st.dataframe(table, use_container_width=True, hide_index=True)
 
     with tab4:
         st.markdown("#### تقرير حركة التوصيل والتحصيل")
@@ -1930,7 +2437,7 @@ def page_reports():
             c2.metric("⏳ الكاش المعلق (عند المندوب/قيد التوصيل)", f"{pending_cash:,.2f}")
 
             st.markdown("#### تفاصيل السجل الكامل للحالات")
-            shown_ord = orders_rep.drop(columns=["أُعيد للمخزون"]).iloc[::-1]
+            shown_ord = orders_rep.drop(columns=["أُعيد للمخزون", "كلفة الوحدة"]).iloc[::-1]
             st.dataframe(shown_ord, use_container_width=True, hide_index=True)
             download_buttons(shown_ord, "تقرير_حركة_التوصيل", "delivery_report")
 
@@ -1954,7 +2461,7 @@ def page_users():
         with st.form("add_user_form", clear_on_submit=True):
             name = st.text_input("اسم المستخدم")
             pw = st.text_input("كلمة المرور (6 أحرف على الأقل)", type="password")
-            role_label = st.selectbox("الصلاحية", ["مشاهد", "مدير"])
+            role_label = st.selectbox("الصلاحية", ["مشاهد", "محاسب", "مدير"])
             ok = st.form_submit_button("إضافة", type="primary")
         if ok:
             name = name.strip()
@@ -1969,7 +2476,7 @@ def page_users():
                 users[name] = {
                     "salt": hp["salt"],
                     "password_hash": hp["password_hash"],
-                    "role": "admin" if role_label == "مدير" else "viewer"
+                    "role": ROLE_BY_LABEL[role_label]
                 }
                 save_users(users)
                 flash(f"تمت إضافة المستخدم «{name}».")
@@ -2008,7 +2515,1017 @@ def page_users():
                     flash(f"تم حذف «{target}».")
                     st.rerun()
 
+# =========================
+# المحاسبة (دور «محاسب»)
+# الصق هذا البلوك كامل قبل سطر:  # التوجيه
+# =========================
+LEDGER_FILE = os.path.join(BASE_DIR, "OVVO_ledger.xlsx")   # المصاريف والقبوض وأجور التوصيل (لا تُحذف، فقط تُلغى بسبب)
+AUDIT_FILE = os.path.join(BASE_DIR, "OVVO_audit.xlsx")     # سجل الرقابة: من عمل إيش ومتى
+ACC_ROLES = ("accountant",)   # الكلفة والأرباح للمحاسب فقط
 
+LEDGER_COLS = ["رقم القيد", "التاريخ", "النوع", "الفئة", "المرجع", "المبلغ", "طريقة الدفع",
+               "البيان", "المستخدم", "وقت الإدخال", "الحالة", "سبب الإلغاء"]
+AUDIT_COLS = ["الوقت", "المستخدم", "الإجراء", "التفاصيل"]
+LG_EXP, LG_FEE, LG_RCPT, LG_SUP = "مصروف", "أجرة توصيل", "قبض من مندوب", "دفع لمورد"
+LG_ACTIVE, LG_VOID = "ساري", "ملغى"
+PAY_CASH, PAY_BANK, PAY_DRV = "نقدي (صندوق)", "بنك / محفظة", "خصم من كاش المندوب"
+EXP_CATS = ["إيجار", "رواتب وأجور", "كهرباء وماء", "تسويق وإعلان", "تغليف", "مواصلات",
+            "صيانة", "رسوم وعمولات", "أخرى"]
+NO_DRIVER = "بدون اسم مندوب"
+
+# شجرة الحسابات
+A_CASH, A_BANK, A_DRV = "الصندوق", "البنك والمحافظ", "ذمم المندوبين (كاش عند المندوب)"
+A_INV, A_AP = "المخزون", "الموردون"
+A_REV, A_VAT = "إيرادات المبيعات", "ضريبة المبيعات المستحقة"
+A_COGS, A_FEE, A_ADJ = "تكلفة البضاعة المباعة", "مصروف أجور التوصيل", "فروقات وتسويات المخزون"
+JCOLS = ["رقم القيد", "التاريخ", "المصدر", "الحساب", "مدين", "دائن", "البيان", "المرجع"]
+SHIP_COLS = ["رقم الشحنة", "التاريخ", "المندوب", "القطع المشحونة", "قطع مُسلّمة",
+             "المبيعات (شامل الضريبة)", "المبيعات الصافية", "التكلفة", "أجرة التوصيل",
+             "ربح الشحنة", "الحالة"]
+
+
+def require_accounting():
+    if current_role not in ACC_ROLES:
+        st.error("هذه الصفحة للمحاسب فقط.")
+        st.stop()
+
+
+def _num_or_none(v):
+    v = pd.to_numeric(v, errors="coerce")
+    return None if pd.isna(v) or v <= 0 else float(v)
+
+
+def _cost_map(data):
+    c = pd.to_numeric(data["الكلفة النهائية"], errors="coerce")
+    return {b: float(x) for b, x in zip(data["الباركود التلقائي"], c) if not pd.isna(x)}
+
+
+# ---------- قراءة/كتابة الجداول (مع نسخة احتياطية) ----------
+def _read_table(path, cols):
+    empty = pd.DataFrame(columns=cols)
+    if not os.path.isfile(path):
+        return empty
+    try:
+        t = pd.read_excel(path, dtype=str)
+    except Exception as e:
+        st.error(f"تعذّرت قراءة {os.path.basename(path)}: {e}")
+        return empty
+    for c in cols:
+        if c not in t.columns:
+            t[c] = ""
+    t = t[cols].fillna("").astype(str)
+    return t.apply(lambda s: s.str.strip())
+
+
+def _write_table(t, path, prefix):
+    tmp = os.path.join(BASE_DIR, "_tmp_" + os.path.basename(path))
+    try:
+        if os.path.isfile(path):
+            os.makedirs(BACKUP_DIR, exist_ok=True)
+            stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            shutil.copy2(path, os.path.join(BACKUP_DIR, f"{prefix}_{stamp}.xlsx"))
+            old = sorted(f for f in os.listdir(BACKUP_DIR) if f.startswith(prefix + "_"))
+            for f in old[:-MAX_BACKUPS]:
+                os.remove(os.path.join(BACKUP_DIR, f))
+        t.to_excel(tmp, index=False)
+        os.replace(tmp, path)
+        return True
+    except PermissionError:
+        st.error(f"تعذّر الحفظ: ملف {os.path.basename(path)} مفتوح في Excel. أغلقه ثم أعد المحاولة.")
+    except Exception as e:
+        st.error(f"تعذّر الحفظ: {e}")
+    finally:
+        if os.path.exists(tmp):
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+    return False
+
+
+def audit(action, details):
+    cur = _read_table(AUDIT_FILE, AUDIT_COLS)
+    row = pd.DataFrame([{
+        "الوقت": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "المستخدم": st.session_state.get("ovvo_username", ""),
+        "الإجراء": action, "التفاصيل": details}], columns=AUDIT_COLS)
+    _write_table(pd.concat([cur, row], ignore_index=True), AUDIT_FILE, "AUDIT")
+
+
+def load_ledger():
+    t = _read_table(LEDGER_FILE, LEDGER_COLS)
+    t["المبلغ"] = pd.to_numeric(t["المبلغ"], errors="coerce").fillna(0.0)
+    t["الحالة"] = t["الحالة"].replace("", LG_ACTIVE)
+    t["المرجع"] = t["المرجع"].str.replace(r"^(\d+)\.0$", r"\1", regex=True)
+    return t
+
+
+def add_ledger_entry(kind, date_, cat, ref, amount, pay, memo):
+    led = load_ledger()
+    entry_id = f"L-{len(led) + 1:04d}"
+    row = {"رقم القيد": entry_id, "التاريخ": date_.isoformat(), "النوع": kind, "الفئة": cat,
+           "المرجع": str(ref), "المبلغ": round(float(amount), 2), "طريقة الدفع": pay,
+           "البيان": memo.strip(),
+           "المستخدم": st.session_state.get("ovvo_username", ""),
+           "وقت الإدخال": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+           "الحالة": LG_ACTIVE, "سبب الإلغاء": ""}
+    out = pd.concat([led, pd.DataFrame([row], columns=LEDGER_COLS)], ignore_index=True)
+    if _write_table(out, LEDGER_FILE, "LEDGER"):
+        audit("قيد جديد", f"{entry_id} | {kind} | {amount:,.2f} | {cat or ref} | {memo.strip()}")
+        return entry_id
+    return None
+
+
+def void_ledger_entry(entry_id, reason):
+    led = load_ledger()
+    m = led["رقم القيد"] == entry_id
+    if not m.any() or led.loc[m, "الحالة"].iloc[0] != LG_ACTIVE:
+        st.error("القيد غير موجود أو ملغى مسبقًا.")
+        return False
+    led.loc[m, ["الحالة", "سبب الإلغاء"]] = [LG_VOID, reason.strip()]
+    if _write_table(led, LEDGER_FILE, "LEDGER"):
+        audit("إلغاء قيد", f"{entry_id} | السبب: {reason.strip()}")
+        return True
+    return False
+
+
+# ---------- مبيعات / شحنات ----------
+def sales_lines(orders, data):
+    """أسطر الطلبات «تم التوصيل» مع الكلفة (لقطة وقت الشحن، وإلا الكلفة الحالية)."""
+    o = orders[orders["الحالة"] == ST_DELIVERED].copy()
+    o = orders[orders["الحالة"] == ST_DELIVERED].copy()
+    if "تاريخ الحالة" not in o.columns:   # ملفات طلبات قديمة بدون العمود
+        o["تاريخ الحالة"] = ""
+    cm = _cost_map(data)
+    cm = _cost_map(data)
+    o["_unit_cost"] = o["الباركود"].map(cm).fillna(0.0)
+    o["_cost_src"] = np.where(o["_unit_cost"] > 0, "الكلفة الحالية", "غير متوفرة")
+    o["_qty"] = pd.to_numeric(o["الكمية"], errors="coerce").fillna(0)
+    o["_amt"] = pd.to_numeric(o["المبلغ المطلوب"], errors="coerce").fillna(0)
+    o["_cogs"] = o["_unit_cost"] * o["_qty"]
+    st_date = o["تاريخ الحالة"].astype(str).str.strip()
+    o["_date"] = np.where(st_date != "", st_date, o["التاريخ"].astype(str))
+    o["_date"] = o["_date"].astype(str).str[:10]
+    return o
+
+
+def ship_summary(orders, data, ledger, vat):
+    if orders.empty:
+        return pd.DataFrame(columns=SHIP_COLS)
+    sl = sales_lines(orders, data)
+    fees = ledger[(ledger["الحالة"] == LG_ACTIVE) & (ledger["النوع"] == LG_FEE)]
+    fee_map = fees.groupby("المرجع")["المبلغ"].sum().to_dict()
+    rows = []
+    for oid, g in orders.groupby("رقم الطلب"):
+        s = sl[sl["رقم الطلب"] == oid]
+        gross = float(s["_amt"].sum())
+        net = gross / (1 + vat / 100)
+        cogs = float(s["_cogs"].sum())
+        fee = float(fee_map.get(str(int(oid)), 0.0))
+        pend = g["الحالة"].isin([ST_OUT, ST_RET_WAIT, ST_CAN_WAIT]).any()
+        rows.append({
+            "رقم الشحنة": int(oid), "التاريخ": str(g["التاريخ"].iloc[0]),
+            "المندوب": str(g["المندوب"].iloc[0]),
+            "القطع المشحونة": int(pd.to_numeric(g["الكمية"], errors="coerce").fillna(0).sum()),
+            "قطع مُسلّمة": int(s["_qty"].sum()),
+            "المبيعات (شامل الضريبة)": round(gross, 2), "المبيعات الصافية": round(net, 2),
+            "التكلفة": round(cogs, 2), "أجرة التوصيل": round(fee, 2),
+            "ربح الشحنة": round(net - cogs - fee, 2),
+            "الحالة": "مفتوحة" if pend else "مغلقة"})
+    return pd.DataFrame(rows, columns=SHIP_COLS).sort_values("رقم الشحنة", ascending=False)
+
+
+def driver_balances(orders, ledger):
+    o = orders.copy()
+    o["_d"] = o["المندوب"].replace("", NO_DRIVER)
+    o["_a"] = pd.to_numeric(o["المبلغ المطلوب"], errors="coerce").fillna(0)
+    deliv = o[o["الحالة"] == ST_DELIVERED].groupby("_d")["_a"].sum()
+    out = o[o["الحالة"] == ST_OUT].groupby("_d")["_a"].sum()
+    act = ledger[ledger["الحالة"] == LG_ACTIVE]
+    rc = act[act["النوع"] == LG_RCPT].groupby("المرجع")["المبلغ"].sum()
+    drv_of = o.groupby("رقم الطلب")["_d"].first()
+    ded = {}
+    for _, r in act[(act["النوع"] == LG_FEE) & (act["طريقة الدفع"] == PAY_DRV)].iterrows():
+        try:
+            d = drv_of.get(int(float(r["المرجع"])), NO_DRIVER)
+        except ValueError:
+            d = NO_DRIVER
+        ded[d] = ded.get(d, 0.0) + float(r["المبلغ"])
+    names = sorted(set(deliv.index) | set(out.index) | set(rc.index) | set(ded))
+    t = pd.DataFrame({
+        "المندوب": names,
+        "مبيعات مُسلّمة": [float(deliv.get(n, 0.0)) for n in names],
+        "مقبوض منه": [float(rc.get(n, 0.0)) for n in names],
+        "أجور مخصومة": [float(ded.get(n, 0.0)) for n in names],
+        "قيد التوصيل (لم يُسلَّم بعد)": [float(out.get(n, 0.0)) for n in names]})
+    t["الرصيد المستحق عليه"] = t["مبيعات مُسلّمة"] - t["مقبوض منه"] - t["أجور مخصومة"]
+    return t.round(2)
+
+
+# ---------- دفتر اليومية ----------
+def build_journal(data, orders, moves, ledger, vat):
+    J = []
+
+    def add(ref, date_, source, memo, lines, link=""):
+        for acct, dr, cr in lines:
+            dr, cr = round(float(dr), 2), round(float(cr), 2)
+            if dr or cr:
+                J.append({"رقم القيد": ref, "التاريخ": str(date_)[:10], "المصدر": source,
+                          "الحساب": acct, "مدين": dr, "دائن": cr, "البيان": memo, "المرجع": link})
+
+    cm = _cost_map(data)
+
+    # 1) المبيعات (عند «تم التوصيل») + تكلفتها
+    for i, r in sales_lines(orders, data).iterrows():
+        amt = round(float(r["_amt"]), 2)
+        net = round(amt / (1 + vat / 100), 2)
+        tax = round(amt - net, 2)
+        oid = int(float(r["رقم الطلب"]))
+        memo = f"بيع {r['الوصف']} ({r['اللون']}/{r['المقاس']}) × {int(r['_qty'])}"
+        link = f"شحنة {oid}"
+        add(f"S-{oid}-{i}", r["_date"], "مبيعات", memo,
+            [(A_DRV, amt, 0), (A_REV, 0, net), (A_VAT, 0, tax)], link)
+        c = round(float(r["_cogs"]), 2)
+        add(f"C-{oid}-{i}", r["_date"], "تكلفة المبيعات", memo, [(A_COGS, c, 0), (A_INV, 0, c)], link)
+
+    # 2) حركات المخزون: إدخال (مشتريات) + تسويات يدوية
+    for n, m in moves.reset_index(drop=True).iterrows():
+        kind = m["نوع الحركة"]
+        if kind not in (MV_IN, MV_ADJ, MV_DEL):
+            continue
+        q = float(m["الكمية"])
+        unit = cm.get(m["الباركود"])
+        if unit is None or q == 0:
+            continue
+        v = round(abs(q) * unit, 2)
+        memo = f"{kind}: {m['الوصف']} ({m['اللون']}/{m['المقاس']}) {q:+g}"
+        if kind == MV_IN:
+            add(f"P-{n + 1}", m["التاريخ"], "إدخال مخزون", memo, [(A_INV, v, 0), (A_AP, 0, v)], m["الباركود"])
+        elif q > 0:
+            add(f"A-{n + 1}", m["التاريخ"], "تسوية مخزون", memo, [(A_INV, v, 0), (A_ADJ, 0, v)], m["الباركود"])
+        else:
+            add(f"A-{n + 1}", m["التاريخ"], "تسوية مخزون", memo, [(A_ADJ, v, 0), (A_INV, 0, v)], m["الباركود"])
+
+    # 3) المصاريف / أجور التوصيل / القبض من المندوب / الدفع للموردين
+    pay_acc = {PAY_CASH: A_CASH, PAY_BANK: A_BANK, PAY_DRV: A_DRV}
+    for _, r in ledger[ledger["الحالة"] == LG_ACTIVE].iterrows():
+        amt = round(float(r["المبلغ"]), 2)
+        pa = pay_acc.get(r["طريقة الدفع"], A_CASH)
+        k = r["النوع"]
+        memo = r["البيان"] or r["الفئة"] or k
+        link = r["المرجع"]
+        if k == LG_EXP:
+            lines, src = [(f"مصروف - {r['الفئة'] or 'أخرى'}", amt, 0), (pa, 0, amt)], "مصاريف"
+        elif k == LG_FEE:
+            lines, src, link = [(A_FEE, amt, 0), (pa, 0, amt)], "أجور توصيل", f"شحنة {link}"
+        elif k == LG_RCPT:
+            lines, src, link = [(pa, amt, 0), (A_DRV, 0, amt)], "قبض من مندوب", f"مندوب: {link}"
+        elif k == LG_SUP:
+            lines, src, link = [(A_AP, amt, 0), (pa, 0, amt)], "دفع لمورد", f"مورد: {link}"
+        else:
+            continue
+        add(r["رقم القيد"], r["التاريخ"], src, memo, lines, link)
+
+    j = pd.DataFrame(J, columns=JCOLS)
+    return j.sort_values("التاريخ", kind="stable").reset_index(drop=True)
+
+
+def acct_kind(a):
+    if a == A_REV:
+        return "إيراد"
+    if a in (A_COGS, A_FEE, A_ADJ) or a.startswith("مصروف"):
+        return "مصروف"
+    if a in (A_VAT, A_AP):
+        return "التزام"
+    return "أصل"
+
+
+def _period(t, col, d_from, d_to):
+    if t.empty:
+        return t
+    ds = t[col].astype(str).str[:10]
+    return t[(ds >= d_from.isoformat()) & (ds <= d_to.isoformat())]
+
+
+def _bal(j, acct, credit=True):
+    s = j[j["الحساب"] == acct]
+    dr, cr = float(s["مدين"].sum()), float(s["دائن"].sum())
+    return cr - dr if credit else dr - cr
+
+
+# ---------- فحوصات الرقابة ----------
+def _sl_view(sl):
+    v = sl[["رقم الطلب", "الوصف", "اللون", "المقاس", "الباركود"]].copy()
+    v["الكمية"], v["المبلغ"] = sl["_qty"], sl["_amt"]
+    v["التكلفة"], v["مصدر الكلفة"] = sl["_cogs"], sl["_cost_src"]
+    return v
+
+
+def control_checks(data, orders, moves, ledger, ships, vat, days, d_from, d_to):
+    checks = []
+    cm = _cost_map(data)
+    cost = pd.to_numeric(data["الكلفة النهائية"], errors="coerce").fillna(0)
+    checks.append(("أصناف بالمخزون بدون كلفة", "عالية",
+                   data[(cost <= 0) & (qty(data) > 0)][["الباركود التلقائي", "وصف", "اللون", "المقاس", "الكمية"]]))
+    sl = sales_lines(orders, data)
+    sl = sl[(sl["_date"] >= d_from.isoformat()) & (sl["_date"] <= d_to.isoformat())] if len(sl) else sl
+    checks.append(("مبيعات مُسلّمة بدون كلفة معروفة", "عالية", _sl_view(sl[sl["_unit_cost"] <= 0])))
+    checks.append(("بيع بأقل من الكلفة", "عالية",
+                   _sl_view(sl[(sl["_unit_cost"] > 0) & (sl["_amt"] < sl["_cogs"])])))
+    checks.append(("مبيعات بسعر صفر", "عالية", _sl_view(sl[sl["_amt"] <= 0])))
+    sp = _period(ships, "التاريخ", d_from, d_to)
+    checks.append(("شحنات فيها مبيعات بدون أجرة توصيل مسجّلة", "متوسطة",
+                   sp[(sp["قطع مُسلّمة"] > 0) & (sp["أجرة التوصيل"] <= 0)]))
+    o = orders[orders["الحالة"].isin([ST_OUT, ST_RET_WAIT, ST_CAN_WAIT])].copy()
+    if len(o):
+        age = (pd.Timestamp.now() - pd.to_datetime(o["التاريخ"], errors="coerce")).dt.days
+        o["أيام مفتوحة"] = age
+        o = o[o["أيام مفتوحة"] >= days][["رقم الطلب", "التاريخ", "المندوب", "الوصف", "الكمية",
+                                         "المبلغ المطلوب", "الحالة", "أيام مفتوحة"]]
+    else:
+        o = pd.DataFrame(columns=["رقم الطلب", "التاريخ", "المندوب", "الوصف", "الكمية",
+                                  "المبلغ المطلوب", "الحالة", "أيام مفتوحة"])
+    checks.append((f"شحنات/مرتجعات مفتوحة منذ {days} يوم أو أكثر", "عالية", o))
+    adj = _period(moves[moves["نوع الحركة"].isin([MV_ADJ, MV_DEL])], "التاريخ", d_from, d_to).copy()
+    adj["القيمة بالكلفة"] = [round(q * cm.get(b, 0.0), 2) for q, b in zip(adj["الكمية"], adj["الباركود"])]
+    checks.append(("تعديلات/حذف كميات يدوية على المخزون", "متوسطة",
+                   adj[["التاريخ", "نوع الحركة", "الوصف", "اللون", "المقاس", "الكمية",
+                        "القيمة بالكلفة", "المستخدم", "ملاحظة"]]))
+    voided = _period(ledger[ledger["الحالة"] == LG_VOID], "التاريخ", d_from, d_to)
+    checks.append(("قيود ملغاة", "متوسطة",
+                   voided[["رقم القيد", "التاريخ", "النوع", "المبلغ", "البيان", "المستخدم", "سبب الإلغاء"]]))
+    db = driver_balances(orders, ledger)
+    checks.append(("مندوب مقبوض منه أكثر من المستحق (رصيد سالب)", "عالية",
+                   db[db["الرصيد المستحق عليه"] < -0.005]))
+    return checks
+
+
+# =========================
+# المحاسبة (دور «محاسب»)
+# الصق هذا البلوك كامل قبل سطر:  # التوجيه
+# =========================
+LEDGER_FILE = os.path.join(BASE_DIR, "OVVO_ledger.xlsx")   # المصاريف والقبوض وأجور التوصيل (لا تُحذف، فقط تُلغى بسبب)
+AUDIT_FILE = os.path.join(BASE_DIR, "OVVO_audit.xlsx")     # سجل الرقابة: من عمل إيش ومتى
+ACC_ROLES = ("accountant",)   # الكلفة والأرباح للمحاسب فقط
+
+LEDGER_COLS = ["رقم القيد", "التاريخ", "النوع", "الفئة", "المرجع", "المبلغ", "طريقة الدفع",
+               "البيان", "المستخدم", "وقت الإدخال", "الحالة", "سبب الإلغاء"]
+AUDIT_COLS = ["الوقت", "المستخدم", "الإجراء", "التفاصيل"]
+LG_EXP, LG_FEE, LG_RCPT, LG_SUP = "مصروف", "أجرة توصيل", "قبض من مندوب", "دفع لمورد"
+LG_ACTIVE, LG_VOID = "ساري", "ملغى"
+PAY_CASH, PAY_BANK, PAY_DRV = "نقدي (صندوق)", "بنك / محفظة", "خصم من كاش المندوب"
+EXP_CATS = ["إيجار", "رواتب وأجور", "كهرباء وماء", "تسويق وإعلان", "تغليف", "مواصلات",
+            "صيانة", "رسوم وعمولات", "أخرى"]
+NO_DRIVER = "بدون اسم مندوب"
+
+# شجرة الحسابات
+A_CASH, A_BANK, A_DRV = "الصندوق", "البنك والمحافظ", "ذمم المندوبين (كاش عند المندوب)"
+A_INV, A_AP = "المخزون", "الموردون"
+A_REV, A_VAT = "إيرادات المبيعات", "ضريبة المبيعات المستحقة"
+A_COGS, A_FEE, A_ADJ = "تكلفة البضاعة المباعة", "مصروف أجور التوصيل", "فروقات وتسويات المخزون"
+JCOLS = ["رقم القيد", "التاريخ", "المصدر", "الحساب", "مدين", "دائن", "البيان", "المرجع"]
+SHIP_COLS = ["رقم الشحنة", "التاريخ", "المندوب", "القطع المشحونة", "قطع مُسلّمة",
+             "المبيعات (شامل الضريبة)", "المبيعات الصافية", "التكلفة", "أجرة التوصيل",
+             "ربح الشحنة", "الحالة"]
+
+
+def require_accounting():
+    if current_role not in ACC_ROLES:
+        st.error("هذه الصفحة للمحاسب فقط.")
+        st.stop()
+
+
+def _num_or_none(v):
+    v = pd.to_numeric(v, errors="coerce")
+    return None if pd.isna(v) or v <= 0 else float(v)
+
+
+def _cost_map(data):
+    c = pd.to_numeric(data["الكلفة النهائية"], errors="coerce")
+    return {b: float(x) for b, x in zip(data["الباركود التلقائي"], c) if not pd.isna(x)}
+
+
+# ---------- قراءة/كتابة الجداول (مع نسخة احتياطية) ----------
+def _read_table(path, cols):
+    empty = pd.DataFrame(columns=cols)
+    if not os.path.isfile(path):
+        return empty
+    try:
+        t = pd.read_excel(path, dtype=str)
+    except Exception as e:
+        st.error(f"تعذّرت قراءة {os.path.basename(path)}: {e}")
+        return empty
+    for c in cols:
+        if c not in t.columns:
+            t[c] = ""
+    t = t[cols].fillna("").astype(str)
+    return t.apply(lambda s: s.str.strip())
+
+
+def _write_table(t, path, prefix):
+    tmp = os.path.join(BASE_DIR, "_tmp_" + os.path.basename(path))
+    try:
+        if os.path.isfile(path):
+            os.makedirs(BACKUP_DIR, exist_ok=True)
+            stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            shutil.copy2(path, os.path.join(BACKUP_DIR, f"{prefix}_{stamp}.xlsx"))
+            old = sorted(f for f in os.listdir(BACKUP_DIR) if f.startswith(prefix + "_"))
+            for f in old[:-MAX_BACKUPS]:
+                os.remove(os.path.join(BACKUP_DIR, f))
+        t.to_excel(tmp, index=False)
+        os.replace(tmp, path)
+        return True
+    except PermissionError:
+        st.error(f"تعذّر الحفظ: ملف {os.path.basename(path)} مفتوح في Excel. أغلقه ثم أعد المحاولة.")
+    except Exception as e:
+        st.error(f"تعذّر الحفظ: {e}")
+    finally:
+        if os.path.exists(tmp):
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+    return False
+
+
+def audit(action, details):
+    cur = _read_table(AUDIT_FILE, AUDIT_COLS)
+    row = pd.DataFrame([{
+        "الوقت": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "المستخدم": st.session_state.get("ovvo_username", ""),
+        "الإجراء": action, "التفاصيل": details}], columns=AUDIT_COLS)
+    _write_table(pd.concat([cur, row], ignore_index=True), AUDIT_FILE, "AUDIT")
+
+
+def load_ledger():
+    t = _read_table(LEDGER_FILE, LEDGER_COLS)
+    t["المبلغ"] = pd.to_numeric(t["المبلغ"], errors="coerce").fillna(0.0)
+    t["الحالة"] = t["الحالة"].replace("", LG_ACTIVE)
+    t["المرجع"] = t["المرجع"].str.replace(r"^(\d+)\.0$", r"\1", regex=True)
+    return t
+
+
+def add_ledger_entry(kind, date_, cat, ref, amount, pay, memo):
+    led = load_ledger()
+    entry_id = f"L-{len(led) + 1:04d}"
+    row = {"رقم القيد": entry_id, "التاريخ": date_.isoformat(), "النوع": kind, "الفئة": cat,
+           "المرجع": str(ref), "المبلغ": round(float(amount), 2), "طريقة الدفع": pay,
+           "البيان": memo.strip(),
+           "المستخدم": st.session_state.get("ovvo_username", ""),
+           "وقت الإدخال": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+           "الحالة": LG_ACTIVE, "سبب الإلغاء": ""}
+    out = pd.concat([led, pd.DataFrame([row], columns=LEDGER_COLS)], ignore_index=True)
+    if _write_table(out, LEDGER_FILE, "LEDGER"):
+        audit("قيد جديد", f"{entry_id} | {kind} | {amount:,.2f} | {cat or ref} | {memo.strip()}")
+        return entry_id
+    return None
+
+
+def void_ledger_entry(entry_id, reason):
+    led = load_ledger()
+    m = led["رقم القيد"] == entry_id
+    if not m.any() or led.loc[m, "الحالة"].iloc[0] != LG_ACTIVE:
+        st.error("القيد غير موجود أو ملغى مسبقًا.")
+        return False
+    led.loc[m, ["الحالة", "سبب الإلغاء"]] = [LG_VOID, reason.strip()]
+    if _write_table(led, LEDGER_FILE, "LEDGER"):
+        audit("إلغاء قيد", f"{entry_id} | السبب: {reason.strip()}")
+        return True
+    return False
+
+
+# ---------- مبيعات / شحنات ----------
+def sales_lines(orders, data):
+    """أسطر الطلبات «تم التوصيل» مع الكلفة (لقطة وقت الشحن، وإلا الكلفة الحالية)."""
+    o = orders[orders["الحالة"] == ST_DELIVERED].copy()
+    cm = _cost_map(data)
+    o["_unit_cost"] = o["الباركود"].map(cm).fillna(0.0)
+    o["_cost_src"] = np.where(o["_unit_cost"] > 0, "الكلفة الحالية", "غير متوفرة")
+    o["_qty"] = pd.to_numeric(o["الكمية"], errors="coerce").fillna(0)
+    o["_amt"] = pd.to_numeric(o["المبلغ المطلوب"], errors="coerce").fillna(0)
+    o["_cogs"] = o["_unit_cost"] * o["_qty"]
+    st_date = o["تاريخ الحالة"].astype(str).str.strip()
+    o["_date"] = np.where(st_date != "", st_date, o["التاريخ"].astype(str))
+    o["_date"] = o["_date"].astype(str).str[:10]
+    return o
+
+
+def ship_summary(orders, data, ledger, vat):
+    if orders.empty:
+        return pd.DataFrame(columns=SHIP_COLS)
+    sl = sales_lines(orders, data)
+    fees = ledger[(ledger["الحالة"] == LG_ACTIVE) & (ledger["النوع"] == LG_FEE)]
+    fee_map = fees.groupby("المرجع")["المبلغ"].sum().to_dict()
+    rows = []
+    for oid, g in orders.groupby("رقم الطلب"):
+        s = sl[sl["رقم الطلب"] == oid]
+        gross = float(s["_amt"].sum())
+        net = gross / (1 + vat / 100)
+        cogs = float(s["_cogs"].sum())
+        fee = float(fee_map.get(str(int(oid)), 0.0))
+        pend = g["الحالة"].isin([ST_OUT, ST_RET_WAIT, ST_CAN_WAIT]).any()
+        rows.append({
+            "رقم الشحنة": int(oid), "التاريخ": str(g["التاريخ"].iloc[0]),
+            "المندوب": str(g["المندوب"].iloc[0]),
+            "القطع المشحونة": int(pd.to_numeric(g["الكمية"], errors="coerce").fillna(0).sum()),
+            "قطع مُسلّمة": int(s["_qty"].sum()),
+            "المبيعات (شامل الضريبة)": round(gross, 2), "المبيعات الصافية": round(net, 2),
+            "التكلفة": round(cogs, 2), "أجرة التوصيل": round(fee, 2),
+            "ربح الشحنة": round(net - cogs - fee, 2),
+            "الحالة": "مفتوحة" if pend else "مغلقة"})
+    return pd.DataFrame(rows, columns=SHIP_COLS).sort_values("رقم الشحنة", ascending=False)
+
+
+def driver_balances(orders, ledger):
+    o = orders.copy()
+    o["_d"] = o["المندوب"].replace("", NO_DRIVER)
+    o["_a"] = pd.to_numeric(o["المبلغ المطلوب"], errors="coerce").fillna(0)
+    deliv = o[o["الحالة"] == ST_DELIVERED].groupby("_d")["_a"].sum()
+    out = o[o["الحالة"] == ST_OUT].groupby("_d")["_a"].sum()
+    act = ledger[ledger["الحالة"] == LG_ACTIVE]
+    rc = act[act["النوع"] == LG_RCPT].groupby("المرجع")["المبلغ"].sum()
+    drv_of = o.groupby("رقم الطلب")["_d"].first()
+    ded = {}
+    for _, r in act[(act["النوع"] == LG_FEE) & (act["طريقة الدفع"] == PAY_DRV)].iterrows():
+        try:
+            d = drv_of.get(int(float(r["المرجع"])), NO_DRIVER)
+        except ValueError:
+            d = NO_DRIVER
+        ded[d] = ded.get(d, 0.0) + float(r["المبلغ"])
+    names = sorted(set(deliv.index) | set(out.index) | set(rc.index) | set(ded))
+    t = pd.DataFrame({
+        "المندوب": names,
+        "مبيعات مُسلّمة": [float(deliv.get(n, 0.0)) for n in names],
+        "مقبوض منه": [float(rc.get(n, 0.0)) for n in names],
+        "أجور مخصومة": [float(ded.get(n, 0.0)) for n in names],
+        "قيد التوصيل (لم يُسلَّم بعد)": [float(out.get(n, 0.0)) for n in names]})
+    t["الرصيد المستحق عليه"] = t["مبيعات مُسلّمة"] - t["مقبوض منه"] - t["أجور مخصومة"]
+    return t.round(2)
+
+
+# ---------- دفتر اليومية ----------
+def build_journal(data, orders, moves, ledger, vat):
+    J = []
+
+    def add(ref, date_, source, memo, lines, link=""):
+        for acct, dr, cr in lines:
+            dr, cr = round(float(dr), 2), round(float(cr), 2)
+            if dr or cr:
+                J.append({"رقم القيد": ref, "التاريخ": str(date_)[:10], "المصدر": source,
+                          "الحساب": acct, "مدين": dr, "دائن": cr, "البيان": memo, "المرجع": link})
+
+    cm = _cost_map(data)
+
+    # 1) المبيعات (عند «تم التوصيل») + تكلفتها
+    for i, r in sales_lines(orders, data).iterrows():
+        amt = round(float(r["_amt"]), 2)
+        net = round(amt / (1 + vat / 100), 2)
+        tax = round(amt - net, 2)
+        oid = int(float(r["رقم الطلب"]))
+        memo = f"بيع {r['الوصف']} ({r['اللون']}/{r['المقاس']}) × {int(r['_qty'])}"
+        link = f"شحنة {oid}"
+        add(f"S-{oid}-{i}", r["_date"], "مبيعات", memo,
+            [(A_DRV, amt, 0), (A_REV, 0, net), (A_VAT, 0, tax)], link)
+        c = round(float(r["_cogs"]), 2)
+        add(f"C-{oid}-{i}", r["_date"], "تكلفة المبيعات", memo, [(A_COGS, c, 0), (A_INV, 0, c)], link)
+
+    # 2) حركات المخزون: إدخال (مشتريات) + تسويات يدوية
+    for n, m in moves.reset_index(drop=True).iterrows():
+        kind = m["نوع الحركة"]
+        if kind not in (MV_IN, MV_ADJ, MV_DEL):
+            continue
+        q = float(m["الكمية"])
+        unit = cm.get(m["الباركود"])
+        if unit is None or q == 0:
+            continue
+        v = round(abs(q) * unit, 2)
+        memo = f"{kind}: {m['الوصف']} ({m['اللون']}/{m['المقاس']}) {q:+g}"
+        if kind == MV_IN:
+            add(f"P-{n + 1}", m["التاريخ"], "إدخال مخزون", memo, [(A_INV, v, 0), (A_AP, 0, v)], m["الباركود"])
+        elif q > 0:
+            add(f"A-{n + 1}", m["التاريخ"], "تسوية مخزون", memo, [(A_INV, v, 0), (A_ADJ, 0, v)], m["الباركود"])
+        else:
+            add(f"A-{n + 1}", m["التاريخ"], "تسوية مخزون", memo, [(A_ADJ, v, 0), (A_INV, 0, v)], m["الباركود"])
+
+    # 3) المصاريف / أجور التوصيل / القبض من المندوب / الدفع للموردين
+    pay_acc = {PAY_CASH: A_CASH, PAY_BANK: A_BANK, PAY_DRV: A_DRV}
+    for _, r in ledger[ledger["الحالة"] == LG_ACTIVE].iterrows():
+        amt = round(float(r["المبلغ"]), 2)
+        pa = pay_acc.get(r["طريقة الدفع"], A_CASH)
+        k = r["النوع"]
+        memo = r["البيان"] or r["الفئة"] or k
+        link = r["المرجع"]
+        if k == LG_EXP:
+            lines, src = [(f"مصروف - {r['الفئة'] or 'أخرى'}", amt, 0), (pa, 0, amt)], "مصاريف"
+        elif k == LG_FEE:
+            lines, src, link = [(A_FEE, amt, 0), (pa, 0, amt)], "أجور توصيل", f"شحنة {link}"
+        elif k == LG_RCPT:
+            lines, src, link = [(pa, amt, 0), (A_DRV, 0, amt)], "قبض من مندوب", f"مندوب: {link}"
+        elif k == LG_SUP:
+            lines, src, link = [(A_AP, amt, 0), (pa, 0, amt)], "دفع لمورد", f"مورد: {link}"
+        else:
+            continue
+        add(r["رقم القيد"], r["التاريخ"], src, memo, lines, link)
+
+    j = pd.DataFrame(J, columns=JCOLS)
+    return j.sort_values("التاريخ", kind="stable").reset_index(drop=True)
+
+
+def acct_kind(a):
+    if a == A_REV:
+        return "إيراد"
+    if a in (A_COGS, A_FEE, A_ADJ) or a.startswith("مصروف"):
+        return "مصروف"
+    if a in (A_VAT, A_AP):
+        return "التزام"
+    return "أصل"
+
+
+def _period(t, col, d_from, d_to):
+    if t.empty:
+        return t
+    ds = t[col].astype(str).str[:10]
+    return t[(ds >= d_from.isoformat()) & (ds <= d_to.isoformat())]
+
+
+def _bal(j, acct, credit=True):
+    s = j[j["الحساب"] == acct]
+    dr, cr = float(s["مدين"].sum()), float(s["دائن"].sum())
+    return cr - dr if credit else dr - cr
+
+
+# ---------- فحوصات الرقابة ----------
+def _sl_view(sl):
+    v = sl[["رقم الطلب", "الوصف", "اللون", "المقاس", "الباركود"]].copy()
+    v["الكمية"], v["المبلغ"] = sl["_qty"], sl["_amt"]
+    v["التكلفة"], v["مصدر الكلفة"] = sl["_cogs"], sl["_cost_src"]
+    return v
+
+
+def control_checks(data, orders, moves, ledger, ships, vat, days, d_from, d_to):
+    checks = []
+    cm = _cost_map(data)
+    cost = pd.to_numeric(data["الكلفة النهائية"], errors="coerce").fillna(0)
+    checks.append(("أصناف بالمخزون بدون كلفة", "عالية",
+                   data[(cost <= 0) & (qty(data) > 0)][["الباركود التلقائي", "وصف", "اللون", "المقاس", "الكمية"]]))
+    sl = sales_lines(orders, data)
+    sl = sl[(sl["_date"] >= d_from.isoformat()) & (sl["_date"] <= d_to.isoformat())] if len(sl) else sl
+    checks.append(("مبيعات مُسلّمة بدون كلفة معروفة", "عالية", _sl_view(sl[sl["_unit_cost"] <= 0])))
+    checks.append(("بيع بأقل من الكلفة", "عالية",
+                   _sl_view(sl[(sl["_unit_cost"] > 0) & (sl["_amt"] < sl["_cogs"])])))
+    checks.append(("مبيعات بسعر صفر", "عالية", _sl_view(sl[sl["_amt"] <= 0])))
+    sp = _period(ships, "التاريخ", d_from, d_to)
+    checks.append(("شحنات فيها مبيعات بدون أجرة توصيل مسجّلة", "متوسطة",
+                   sp[(sp["قطع مُسلّمة"] > 0) & (sp["أجرة التوصيل"] <= 0)]))
+    o = orders[orders["الحالة"].isin([ST_OUT, ST_RET_WAIT, ST_CAN_WAIT])].copy()
+    if len(o):
+        age = (pd.Timestamp.now() - pd.to_datetime(o["التاريخ"], errors="coerce")).dt.days
+        o["أيام مفتوحة"] = age
+        o = o[o["أيام مفتوحة"] >= days][["رقم الطلب", "التاريخ", "المندوب", "الوصف", "الكمية",
+                                         "المبلغ المطلوب", "الحالة", "أيام مفتوحة"]]
+    else:
+        o = pd.DataFrame(columns=["رقم الطلب", "التاريخ", "المندوب", "الوصف", "الكمية",
+                                  "المبلغ المطلوب", "الحالة", "أيام مفتوحة"])
+    checks.append((f"شحنات/مرتجعات مفتوحة منذ {days} يوم أو أكثر", "عالية", o))
+    adj = _period(moves[moves["نوع الحركة"].isin([MV_ADJ, MV_DEL])], "التاريخ", d_from, d_to).copy()
+    adj["القيمة بالكلفة"] = [round(q * cm.get(b, 0.0), 2) for q, b in zip(adj["الكمية"], adj["الباركود"])]
+    checks.append(("تعديلات/حذف كميات يدوية على المخزون", "متوسطة",
+                   adj[["التاريخ", "نوع الحركة", "الوصف", "اللون", "المقاس", "الكمية",
+                        "القيمة بالكلفة", "المستخدم", "ملاحظة"]]))
+    voided = _period(ledger[ledger["الحالة"] == LG_VOID], "التاريخ", d_from, d_to)
+    checks.append(("قيود ملغاة", "متوسطة",
+                   voided[["رقم القيد", "التاريخ", "النوع", "المبلغ", "البيان", "المستخدم", "سبب الإلغاء"]]))
+    db = driver_balances(orders, ledger)
+    checks.append(("مندوب مقبوض منه أكثر من المستحق (رصيد سالب)", "عالية",
+                   db[db["الرصيد المستحق عليه"] < -0.005]))
+    return checks
+
+
+# =========================
+# صفحة المحاسبة
+# =========================
+def page_accounting():
+    require_accounting()
+    page_header("المحاسبة والرقابة المالية",
+                "قيود البيع والمخزون والمصاريف وأجور التوصيل، مع ذمم المندوبين وميزان المراجعة وسجل الرقابة.")
+    orders, moves, ledger = load_orders(), load_moves(), load_ledger()
+    today = date.today()
+    c1, c2, c3 = st.columns(3)
+    d_from = c1.date_input("من تاريخ", value=today.replace(day=1), key="acc_from")
+    d_to = c2.date_input("إلى تاريخ", value=today, key="acc_to")
+    vat = c3.number_input("نسبة ضريبة المبيعات % (الأسعار شاملة الضريبة، 0 = بدون)",
+                          min_value=0.0, max_value=50.0, value=16.0, step=0.5, key="acc_vat")
+    if d_from > d_to:
+        st.error("تاريخ البداية بعد تاريخ النهاية.")
+        return
+
+    j_all = build_journal(df, orders, moves, ledger, vat)
+    j = _period(j_all, "التاريخ", d_from, d_to)
+    ships = ship_summary(orders, df, ledger, vat)
+    ships_p = _period(ships, "التاريخ", d_from, d_to)
+
+    tabs = st.tabs(["📊 الملخص", "🚚 أجور التوصيل", "🧾 المصاريف والقبوض", "👥 ذمم المندوبين",
+                    "📒 دفتر اليومية", "⚖️ ميزان المراجعة والأستاذ", "🛡️ الرقابة والمراجعة"])
+
+    # ---------------- الملخص ----------------
+    with tabs[0]:
+        rev, tax = _bal(j, A_REV), _bal(j, A_VAT)
+        cogs, fee, adj = _bal(j, A_COGS, False), _bal(j, A_FEE, False), _bal(j, A_ADJ, False)
+        om = j[j["الحساب"].str.startswith("مصروف - ")]
+        other = float(om["مدين"].sum() - om["دائن"].sum())
+        gross = rev - cogs
+        net = gross - fee - adj - other
+        a1, a2, a3, a4 = st.columns(4)
+        a1.metric("صافي المبيعات (بدون ضريبة)", f"{rev:,.2f}")
+        a2.metric("ضريبة المبيعات المستحقة", f"{tax:,.2f}")
+        a3.metric("تكلفة البضاعة المباعة", f"{cogs:,.2f}")
+        a4.metric("مجمل الربح", f"{gross:,.2f}", f"{(gross / rev * 100 if rev else 0):.1f}%")
+        b1, b2, b3, b4 = st.columns(4)
+        b1.metric("أجور التوصيل", f"{fee:,.2f}")
+        b2.metric("مصاريف أخرى", f"{other:,.2f}")
+        b3.metric("فروقات/تسويات مخزون", f"{adj:,.2f}")
+        b4.metric("صافي الربح", f"{net:,.2f}")
+
+        cm = _cost_map(df)
+        stock_cost = float(sum(q * cm.get(b, 0.0) for q, b in zip(qty(df), df["الباركود التلقائي"])))
+        stock_retail = float((qty(df) * pd.to_numeric(df["سعر البيع"], errors="coerce").fillna(0)).sum())
+        ot = orders[orders["الحالة"] == ST_OUT]
+        transit = float(sum(float(q) * cm.get(b, 0.0)
+                            for q, b in zip(pd.to_numeric(ot["الكمية"], errors="coerce").fillna(0), ot["الباركود"])))
+        db = driver_balances(orders, ledger)
+        d1, d2, d3, d4 = st.columns(4)
+        d1.metric("قيمة المخزون بالكلفة", f"{stock_cost:,.2f}")
+        d2.metric("قيمة المخزون بسعر البيع", f"{stock_retail:,.2f}")
+        d3.metric("بضاعة عند المندوبين (كلفة)", f"{transit:,.2f}")
+        d4.metric("كاش مستحق على المندوبين", f"{db['الرصيد المستحق عليه'].sum():,.2f}")
+
+        st.markdown("#### الأرباح حسب الشحنة (شحنات الفترة)")
+        if ships_p.empty:
+            st.info("لا توجد شحنات بهالفترة.")
+        else:
+            st.dataframe(ships_p, use_container_width=True, hide_index=True)
+            download_buttons(ships_p, "ربح_الشحنات", "acc_ships")
+
+        st.markdown("#### ربح كل طلب مُسلّم (قبل أجرة التوصيل)")
+        sl = sales_lines(orders, df)
+        if len(sl):
+            sl = sl[(sl["_date"] >= d_from.isoformat()) & (sl["_date"] <= d_to.isoformat())]
+        if len(sl):
+            v = _sl_view(sl)
+            v["صافي البيع"] = (sl["_amt"] / (1 + vat / 100)).round(2)
+            v["الربح"] = (v["صافي البيع"] - sl["_cogs"]).round(2)
+            st.dataframe(v, use_container_width=True, hide_index=True)
+            download_buttons(v, "ربح_الطلبات", "acc_lines")
+        else:
+            st.info("لا توجد طلبات «تم التوصيل» بهالفترة.")
+
+    # ---------------- أجور التوصيل ----------------
+    with tabs[1]:
+        st.markdown("#### كلفة التوصيل لكل شحنة")
+        sp = ships_p
+        tot_fee = float(sp["أجرة التوصيل"].sum()) if len(sp) else 0.0
+        with_fee = int((sp["أجرة التوصيل"] > 0).sum()) if len(sp) else 0
+        tot_net = float(sp["المبيعات الصافية"].sum()) if len(sp) else 0.0
+        k1, k2, k3, k4 = st.columns(4)
+        k1.metric("إجمالي أجور التوصيل", f"{tot_fee:,.2f}")
+        k2.metric("متوسط الأجرة للشحنة", f"{(tot_fee / with_fee if with_fee else 0):,.2f}")
+        k3.metric("نسبة الأجور من المبيعات", f"{(tot_fee / tot_net * 100 if tot_net else 0):.1f}%")
+        k4.metric("شحنات بدون أجرة مسجلة", int(((sp["أجرة التوصيل"] <= 0) & (sp["قطع مُسلّمة"] > 0)).sum()) if len(sp) else 0)
+        if len(sp):
+            st.dataframe(sp[["رقم الشحنة", "التاريخ", "المندوب", "قطع مُسلّمة", "المبيعات الصافية",
+                             "التكلفة", "أجرة التوصيل", "ربح الشحنة", "الحالة"]],
+                         use_container_width=True, hide_index=True)
+
+        st.markdown("#### تسجيل أجرة توصيل لشحنة")
+        labels = {f"#{int(r['رقم الشحنة'])} — {str(r['التاريخ'])[:10]} — {r['المندوب'] or '—'} — "
+                  f"{r['القطع المشحونة']} قطعة": int(r["رقم الشحنة"]) for _, r in ships.iterrows()}
+        if not labels:
+            st.info("لا توجد شحنات بعد.")
+        else:
+            with st.form("fee_form", clear_on_submit=True):
+                sel = st.selectbox("الشحنة", list(labels))
+                amount = st.number_input("أجرة التوصيل", min_value=0.0, step=0.25, format="%.2f")
+                pay = st.selectbox("طريقة الدفع", [PAY_DRV, PAY_CASH, PAY_BANK],
+                                   help="«خصم من كاش المندوب» = المندوب أخذ أجرته من الكاش اللي معه.")
+                memo = st.text_input("ملاحظة")
+                ok = st.form_submit_button("تسجيل الأجرة", type="primary")
+            if ok:
+                oid = labels[sel]
+                exist = ledger[(ledger["النوع"] == LG_FEE) & (ledger["المرجع"] == str(oid))
+                               & (ledger["الحالة"] == LG_ACTIVE)]
+                if amount <= 0:
+                    st.error("اكتب مبلغ أكبر من صفر.")
+                elif len(exist):
+                    st.error(f"الشحنة #{oid} إلها أجرة مسجلة بالقيد {exist['رقم القيد'].iloc[0]}. "
+                             "ألغِ القيد أولًا (مع ذكر السبب) من تبويب «المصاريف والقبوض».")
+                elif add_ledger_entry(LG_FEE, today, "أجور توصيل", oid, amount, pay,
+                                      memo or f"أجرة توصيل شحنة {oid}"):
+                    flash(f"تم تسجيل أجرة الشحنة #{oid}.")
+                    st.rerun()
+
+    # ---------------- المصاريف والقبوض ----------------
+    with tabs[2]:
+        kind = st.radio("نوع القيد", [LG_EXP, LG_RCPT, LG_SUP], horizontal=True, key="lg_kind")
+        drivers = sorted(set(orders["المندوب"].replace("", NO_DRIVER))) or [NO_DRIVER]
+        with st.form("ledger_form", clear_on_submit=True):
+            f1, f2, f3 = st.columns(3)
+            d_ = f1.date_input("التاريخ", value=today)
+            amount = f2.number_input("المبلغ", min_value=0.0, step=0.5, format="%.2f")
+            pay = f3.selectbox("الدفع / القبض عبر", [PAY_CASH, PAY_BANK])
+            cat = ref = ""
+            if kind == LG_EXP:
+                cat = st.selectbox("الفئة", EXP_CATS)
+            elif kind == LG_RCPT:
+                ref = st.selectbox("المندوب", drivers)
+            else:
+                ref = st.text_input("اسم المورد *")
+            memo = st.text_input("البيان * (إجباري للرقابة)")
+            ok = st.form_submit_button("تسجيل القيد", type="primary")
+        if ok:
+            if amount <= 0:
+                st.error("اكتب مبلغ أكبر من صفر.")
+            elif not memo.strip():
+                st.error("البيان إجباري.")
+            elif d_ > today:
+                st.error("ما بيصير تسجل قيد بتاريخ مستقبلي.")
+            elif kind == LG_SUP and not ref.strip():
+                st.error("اكتب اسم المورد.")
+            else:
+                eid = add_ledger_entry(kind, d_, cat, ref.strip(), amount, pay, memo)
+                if eid:
+                    flash(f"تم تسجيل القيد {eid}.")
+                    st.rerun()
+
+        st.markdown("#### سجل القيود اليدوية")
+        lp = _period(ledger, "التاريخ", d_from, d_to)
+        if lp.empty:
+            st.info("لا توجد قيود بهالفترة.")
+        else:
+            st.dataframe(lp.iloc[::-1], use_container_width=True, hide_index=True)
+            download_buttons(lp, "القيود_اليدوية", "acc_ledger")
+        active = ledger[ledger["الحالة"] == LG_ACTIVE]
+        if len(active):
+            with st.expander("إلغاء قيد (ما في حذف، الإلغاء بيبقى ظاهر بالسجل)"):
+                with st.form("void_form", clear_on_submit=True):
+                    opts = {f"{r['رقم القيد']} | {r['النوع']} | {r['المبلغ']:,.2f} | {r['البيان']}": r["رقم القيد"]
+                            for _, r in active.iloc[::-1].iterrows()}
+                    pick = st.selectbox("القيد", list(opts))
+                    reason = st.text_input("سبب الإلغاء *")
+                    vok = st.form_submit_button("إلغاء القيد")
+                if vok:
+                    if len(reason.strip()) < 3:
+                        st.error("اكتب سبب الإلغاء.")
+                    elif void_ledger_entry(opts[pick], reason):
+                        flash("تم إلغاء القيد.")
+                        st.rerun()
+
+    # ---------------- ذمم المندوبين ----------------
+    with tabs[3]:
+        st.caption("المستحق = مبيعات «تم التوصيل» − ما قبضناه منه − أجوره المخصومة من الكاش. "
+                   "سجّل كل تسليم كاش من تبويب «المصاريف والقبوض» (قبض من مندوب).")
+        db = driver_balances(orders, ledger)
+        if db.empty:
+            st.info("لا توجد بيانات توصيل.")
+        else:
+            st.metric("إجمالي الكاش المستحق على المندوبين", f"{db['الرصيد المستحق عليه'].sum():,.2f}")
+            st.dataframe(db, use_container_width=True, hide_index=True)
+            download_buttons(db, "ذمم_المندوبين", "acc_drivers")
+
+    # ---------------- دفتر اليومية ----------------
+    with tabs[4]:
+        if j.empty:
+            st.info("لا توجد قيود بهالفترة.")
+        else:
+            srcs = ["الكل"] + sorted(j["المصدر"].unique())
+            f_src = st.selectbox("المصدر", srcs, key="acc_src")
+            jj = j if f_src == "الكل" else j[j["المصدر"] == f_src]
+            m1, m2, m3 = st.columns(3)
+            m1.metric("مجموع المدين", f"{jj['مدين'].sum():,.2f}")
+            m2.metric("مجموع الدائن", f"{jj['دائن'].sum():,.2f}")
+            m3.metric("الفرق (لازم صفر)", f"{round(jj['مدين'].sum() - jj['دائن'].sum(), 2):,.2f}")
+            st.dataframe(jj, use_container_width=True, hide_index=True)
+            download_buttons(jj, "دفتر_اليومية", "acc_journal")
+
+    # ---------------- ميزان المراجعة والأستاذ ----------------
+    with tabs[5]:
+        if j.empty:
+            st.info("لا توجد قيود بهالفترة.")
+        else:
+            tb = j.groupby("الحساب")[["مدين", "دائن"]].sum().reset_index()
+            tb.insert(1, "النوع", tb["الحساب"].map(acct_kind))
+            diff = tb["مدين"] - tb["دائن"]
+            tb["رصيد مدين"] = diff.clip(lower=0).round(2)
+            tb["رصيد دائن"] = (-diff).clip(lower=0).round(2)
+            tot = {"الحساب": "الإجمالي", "النوع": "", "مدين": tb["مدين"].sum(), "دائن": tb["دائن"].sum(),
+                   "رصيد مدين": tb["رصيد مدين"].sum(), "رصيد دائن": tb["رصيد دائن"].sum()}
+            st.markdown("#### ميزان المراجعة")
+            st.dataframe(pd.concat([tb, pd.DataFrame([tot])], ignore_index=True),
+                         use_container_width=True, hide_index=True)
+            st.caption("رصيد حساب «المخزون» هنا = حركة الفترة فقط (الرصيد الافتتاحي قبل تشغيل السجل غير مُدخل). "
+                       "للقيمة الفعلية شوف «قيمة المخزون بالكلفة» بالملخص.")
+            st.markdown("#### كشف حساب (أستاذ)")
+            acct = st.selectbox("الحساب", sorted(j["الحساب"].unique()), key="acc_ledger_sel")
+            g = j[j["الحساب"] == acct].copy()
+            g["الرصيد"] = (g["مدين"] - g["دائن"]).cumsum().round(2)
+            st.dataframe(g[["التاريخ", "رقم القيد", "المصدر", "البيان", "مدين", "دائن", "الرصيد"]],
+                         use_container_width=True, hide_index=True)
+            download_buttons(g, "كشف_حساب", "acc_acct")
+
+    # ---------------- الرقابة والمراجعة ----------------
+    with tabs[6]:
+        days = int(st.number_input("اعتبر الشحنة/المرتجع متأخرًا بعد (أيام)", min_value=1, max_value=90,
+                                   value=7, step=1, key="acc_days"))
+        checks = control_checks(df, orders, moves, ledger, ships, vat, days, d_from, d_to)
+        st.dataframe(pd.DataFrame([{
+            "الفحص": n, "الأهمية": s, "العدد": len(t),
+            "الحالة": "✅ سليم" if t.empty else "⚠️ يحتاج مراجعة"} for n, s, t in checks]),
+            use_container_width=True, hide_index=True)
+        for n, s, t in checks:
+            if not t.empty:
+                with st.expander(f"{n} ({len(t)})"):
+                    st.dataframe(t, use_container_width=True, hide_index=True)
+        st.markdown("#### سجل الرقابة (من عمل إيش ومتى)")
+        au = _read_table(AUDIT_FILE, AUDIT_COLS)
+        if au.empty:
+            st.info("لا توجد عمليات مسجّلة بعد.")
+        else:
+            st.dataframe(au.iloc[::-1], use_container_width=True, hide_index=True)
+            download_buttons(au, "سجل_الرقابة", "acc_audit")
+
+
+# =========================
+# تكاليف المنتجات (المحاسب فقط)
+# =========================
+def page_costs():
+    require_accounting()
+    page_header("تكاليف المنتجات",
+                "أدخل كلفة كل موديل مرة وحدة، وبتنطبق على كل ألوانه ومقاساته. الأرباح بتنحسب لحالها لما الطلب يصير «تم التوصيل».")
+    data, _ = load_data()
+    if data.empty:
+        st.info("لا توجد أصناف بعد.")
+        return
+    keys = pd.Series([m if m else f"بدون موديل #{b}" for m, b in
+                      zip(data["رقم الموديل"], data["الباركود التلقائي"])], index=data.index)
+    cost = pd.to_numeric(data["الكلفة النهائية"], errors="coerce").fillna(0.0)
+    price = pd.to_numeric(data["سعر البيع"], errors="coerce").fillna(0.0)
+    rows = []
+    for k in sorted(keys.unique(), key=_model_sort_key):
+        m = keys == k
+        c = cost[m]
+        c_pos = c[c > 0]
+        rows.append({
+            "الموديل": k,
+            "الوصف": next((x for x in data.loc[m, "وصف"] if x), ""),
+            "نوع الصنف": next((x for x in data.loc[m, "نوع الصنف"] if x), ""),
+            "القطع": int(qty(data)[m].sum()),
+            "سعر البيع": float(price[m].max()),
+            "الكلفة": float(c_pos.iloc[0]) if len(c_pos) else 0.0,
+        })
+    full = pd.DataFrame(rows)
+
+    c1, c2 = st.columns([2, 1])
+    q = c1.text_input("بحث (موديل أو وصف)", key="cost_q")
+    only_missing = c2.checkbox("الموديلات بدون كلفة فقط", key="cost_missing")
+    view = full
+    if q.strip():
+        t = q.strip().lower()
+        view = view[view["الموديل"].astype(str).str.lower().str.contains(t, regex=False)
+                    | view["الوصف"].astype(str).str.lower().str.contains(t, regex=False)]
+    if only_missing:
+        view = view[view["الكلفة"] <= 0]
+    st.caption(f"{len(view):,} موديل — بدون كلفة: {int((full['الكلفة'] <= 0).sum()):,}")
+    if view.empty:
+        st.info("لا نتائج.")
+        return
+
+    edited = st.data_editor(
+        view, hide_index=True, use_container_width=True, num_rows="fixed",
+        disabled=["الموديل", "الوصف", "نوع الصنف", "القطع", "سعر البيع"],
+        column_config={
+            "الكلفة": st.column_config.NumberColumn("الكلفة (للقطعة)", min_value=0.0, step=0.25, format="%.2f"),
+            "سعر البيع": st.column_config.NumberColumn("سعر البيع", format="%.2f"),
+        },
+        key=f"cost_editor_{hashlib.md5((q + str(only_missing)).encode('utf-8')).hexdigest()[:8]}")
+
+    if st.button("💾 حفظ التكاليف", type="primary", use_container_width=True):
+        old = dict(zip(full["الموديل"], full["الكلفة"]))
+        changes = []
+        for _, r in edited.iterrows():
+            new = pd.to_numeric(r["الكلفة"], errors="coerce")
+            if pd.isna(new) or new < 0:
+                st.error(f"كلفة غير صالحة للموديل {r['الموديل']}.")
+                return
+            if abs(float(new) - old[r["الموديل"]]) > 1e-9:
+                changes.append((r["الموديل"], old[r["الموديل"]], round(float(new), 4)))
+        if not changes:
+            st.info("ما في تعديلات للحفظ.")
+            return
+        for k, _, new in changes:
+            data.loc[keys == k, "الكلفة النهائية"] = new
+        if save_data(data):
+            audit("تغيير كلفة", " | ".join(f"موديل {k}: {o:,.2f} ← {n:,.2f}" for k, o, n in changes))
+            flash(f"تم حفظ كلفة {len(changes)} موديل.")
+            st.rerun()
 # =========================
 # التوجيه
 # =========================
@@ -2024,7 +3541,13 @@ elif page == "🚚 التوصيل":
     page_delivery()
 elif page == "🔎 البحث":
     page_search()
+elif page == "📋 كشف المواد":
+    page_statement()
 elif page == "📑 التقارير والطباعة":
     page_reports()
 elif page == "👤 إدارة المستخدمين":
     page_users()
+elif page == "💰 كلف المنتجات":
+    page_costs()
+elif page == "🧮 المحاسبة":
+    page_accounting()
